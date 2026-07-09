@@ -51,7 +51,11 @@ from claude_swap import oauth
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json
+from claude_swap.settings import (
+    AutoSwitchSettings,
+    atomic_write_json,
+    is_reserved_account,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate
 
@@ -883,11 +887,21 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         # -- candidate selection ------------------------------------------
-        candidates = [
+        switchable = [
             num
             for num in self.switcher.switchable_account_numbers()
             if num != current and num not in quarantined
         ]
+        reserved = {
+            num
+            for num in switchable
+            if is_reserved_account(
+                num,
+                self.switcher.account_email(num),
+                settings,
+            )
+        }
+        candidates = [num for num in switchable if num not in reserved]
         oauth_candidates = [
             n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
         ]
@@ -900,7 +914,16 @@ class AutoSwitchEngine:
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.
             self._blocked_wait_long = True
-            self._emit(NoSwitchEvent(reason="no-candidates"))
+            self._emit(
+                NoSwitchEvent(
+                    reason="no-candidates",
+                    detail=(
+                        "all other accounts are reserved or unavailable"
+                        if reserved
+                        else ""
+                    ),
+                )
+            )
             return TickOutcome.BLOCKED
 
         hysteresis_bar = settings.threshold - settings.hysteresis_pct
@@ -1019,7 +1042,11 @@ class AutoSwitchEngine:
                 )
                 return TickOutcome.BLOCKED
             self._blocked_wait_long = True
-            earliest = self._earliest_reset(usage, self._models)
+            eligible_usage = {
+                num: usage.get(num)
+                for num in {current, *oauth_candidates}
+            }
+            earliest = self._earliest_reset(eligible_usage, self._models)
             if earliest is not None:
                 self._sleep_until_ts = earliest.timestamp() + RESET_SLACK_S
             self._emit(

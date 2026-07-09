@@ -59,6 +59,9 @@ class AutoSwitchSettings:
     # threshold so draining weekly inventory never weakens session safety.
     drain_window_hours: float = 0.0
     drain_threshold: float = 98.0
+    # Comma-separated slot numbers or email addresses that remain tracked but
+    # are never selected automatically. Manual switching is still allowed.
+    reserved_accounts: str | None = None
 
     @property
     def models(self) -> tuple[str, ...]:
@@ -68,6 +71,25 @@ class AutoSwitchSettings:
             for model in (self.model or "").split(",")
             if model.strip()
         )
+
+    @property
+    def reserved_account_refs(self) -> tuple[str, ...]:
+        """Reserved slot numbers/emails normalized from the CSV setting."""
+        return tuple(
+            ref.strip()
+            for ref in (self.reserved_accounts or "").split(",")
+            if ref.strip()
+        )
+
+
+def is_reserved_account(
+    number: str | int,
+    email: str,
+    settings: AutoSwitchSettings,
+) -> bool:
+    """Whether a slot matches a configured reservation number or email."""
+    wanted = {ref.casefold() for ref in settings.reserved_account_refs}
+    return str(number).casefold() in wanted or email.casefold() in wanted
 
 
 @dataclass(frozen=True)
@@ -142,6 +164,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "drainThreshold", "drain_threshold", "float", 50.0, 99.9,
             help="Final configured-model threshold reached just before reset",
+        ),
+        SettingSpec(
+            "autoswitch", "reservedAccounts", "reserved_accounts", "string",
+            help="Comma-separated slot numbers/emails excluded from automatic targets",
         ),
     )
 }
@@ -399,6 +425,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("model", "model"),
         ("drain_window", "drain_window_hours"),
         ("drain_threshold", "drain_threshold"),
+        ("reserved_accounts", "reserved_accounts"),
     ):
         value = getattr(args, attr, None)
         if value is not None:

@@ -869,10 +869,12 @@ class TestAutoCommand:
             "--model", "Fable",
             "--drain-window", "12",
             "--drain-threshold", "98",
+            "--reserved-accounts", "7,desktop@example.com",
         ], temp_home)
         settings = self.FakeEngine.instances[-1].settings
         assert settings.drain_window_hours == 12.0
         assert settings.drain_threshold == 98.0
+        assert settings.reserved_account_refs == ("7", "desktop@example.com")
 
     def test_dry_run_forwarded(self, temp_home):
         self._run(["--once", "--dry-run"], temp_home)
@@ -913,6 +915,7 @@ class TestAutoCommand:
         out = capsys.readouterr().out
         assert "--once" in out
         assert "--drain-window" in out
+        assert "--reserved-accounts" in out
         assert "Exit codes" in out
 
     def test_main_help_mentions_auto(self):

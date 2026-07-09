@@ -25,6 +25,7 @@ from pathlib import Path
 
 from claude_swap import oauth
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
+from claude_swap.settings import is_reserved_account
 from claude_swap.switcher import SENTINEL_NOTES
 from claude_swap.tui.data import format_age as format_usage_age
 
@@ -184,9 +185,12 @@ def format_account_label(
     now: float | None = None,
     models: tuple[str, ...] = (),
     age_s: float | None = None,
+    reserved: bool = False,
 ) -> str:
     """Build one account row's menu label."""
     label = f"{num}  {email}  {usage_summary(usage, now, models)}"
+    if reserved:
+        label += " · reserved"
     age = format_usage_age(age_s) if isinstance(usage, dict) else None
     if age:
         label += f" {age}"
@@ -548,7 +552,11 @@ def run(switcher) -> int:
 
         # ---- menu construction -----------------------------------------------
         def rebuild_menu(self):
-            models = self._models()
+            try:
+                auto_settings = load_settings(self.switcher.backup_dir)
+            except Exception:
+                auto_settings = None
+            models = auto_settings.models if auto_settings else ()
             self.title = format_title(
                 self.snapshot["active_email"],
                 self.snapshot["active_usage"],
@@ -560,7 +568,15 @@ def run(switcher) -> int:
             for num, email, is_active, display, _last_good, age_s in self.snapshot["accounts"]:
                 item = rumps.MenuItem(
                     format_account_label(
-                        num, email, display, models=models, age_s=age_s
+                        num,
+                        email,
+                        display,
+                        models=models,
+                        age_s=age_s,
+                        reserved=(
+                            is_reserved_account(num, email, auto_settings)
+                            if auto_settings else False
+                        ),
                     ),
                     callback=self._make_switch_to(num),
                 )

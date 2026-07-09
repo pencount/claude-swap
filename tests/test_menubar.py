@@ -125,6 +125,16 @@ def test_format_account_label_marks_stale_numeric_usage_only():
     assert "ago" not in sentinel
 
 
+def test_format_account_label_marks_reserved_account():
+    label = menubar.format_account_label(
+        7,
+        "desktop@example.com",
+        _USAGE,
+        reserved=True,
+    )
+    assert label.endswith("· reserved")
+
+
 # --- usage logging -------------------------------------------------------------
 
 def test_format_usage_log_full():

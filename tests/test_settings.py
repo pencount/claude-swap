@@ -15,6 +15,7 @@ from claude_swap.settings import (
     SETTING_SPECS,
     AutoSwitchSettings,
     effective_settings,
+    is_reserved_account,
     load_settings,
     merged_with_cli,
     save_settings,
@@ -34,6 +35,7 @@ def _args(**kwargs) -> argparse.Namespace:
         "model": None,
         "drain_window": None,
         "drain_threshold": None,
+        "reserved_accounts": None,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -101,6 +103,15 @@ class TestLoadSettings:
     def test_models_parses_csv_names(self):
         settings = AutoSwitchSettings(model=" Fable, Opus ,,Sonnet ")
         assert settings.models == ("Fable", "Opus", "Sonnet")
+
+    def test_reserved_accounts_match_slot_or_email_case_insensitively(self):
+        settings = AutoSwitchSettings(
+            reserved_accounts=" 7, Desktop@Example.com ,, "
+        )
+        assert settings.reserved_account_refs == ("7", "Desktop@Example.com")
+        assert is_reserved_account("7", "other@example.com", settings)
+        assert is_reserved_account("2", "desktop@example.COM", settings)
+        assert not is_reserved_account("2", "other@example.com", settings)
 
 
 class TestSaveSettings:
@@ -179,6 +190,17 @@ class TestSetUnsetSetting:
         loaded = load_settings(tmp_path)
         assert loaded.drain_window_hours == 12.0
         assert loaded.drain_threshold == 98.0
+
+    def test_set_reserved_accounts_round_trip(self, tmp_path: Path):
+        value = set_setting(
+            tmp_path,
+            "autoswitch.reservedAccounts",
+            "7,desktop@example.com",
+        )
+        assert value == "7,desktop@example.com"
+        assert load_settings(tmp_path).reserved_account_refs == (
+            "7", "desktop@example.com"
+        )
 
     def test_set_string_kind_rejects_empty(self, tmp_path: Path):
         with pytest.raises(ConfigError, match="unset"):
@@ -273,3 +295,10 @@ class TestMergedWithCli:
         )
         assert merged.drain_window_hours == 12.0
         assert merged.drain_threshold == 97.0
+
+    def test_reserved_accounts_override(self):
+        merged = merged_with_cli(
+            AutoSwitchSettings(),
+            _args(reserved_accounts="7,desktop@example.com"),
+        )
+        assert merged.reserved_account_refs == ("7", "desktop@example.com")
