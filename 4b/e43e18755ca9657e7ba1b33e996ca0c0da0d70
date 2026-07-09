@@ -1,0 +1,38 @@
+src/claude_swap/autoswitch.py
+  s_51f06d0600a287::t_390f78045fe810 54-58,890,895-904,917-926,1045-1049
+tests/test_autoswitch.py
+  s_51f06d0600a287::t_2519314fd38e00 1510-1574
+tests/test_settings.py
+  s_51f06d0600a287::t_1bac263fc07411 18,38,107-115,194-204,298-304
+tests/test_cli.py
+  s_51f06d0600a287::t_c4a762e56724c4 872,877,918
+tests/test_config_cli.py
+  s_51f06d0600a287::t_c00d283f2467c2 53,56,83
+src/claude_swap/menubar.py
+  s_51f06d0600a287::t_5f9da77117b547 28,188,192-193,555-559,571-579
+src/claude_swap/settings.py
+  s_51f06d0600a287::t_f567c3fa0883e3 62-64,75-93,168-171,428
+README.md
+  s_51f06d0600a287::t_d8404c5b49598b 91,108,226
+src/claude_swap/cli.py
+  s_51f06d0600a287::t_965343b8b243e9 217,283-288
+  s_51f06d0600a287::t_724f293325d9ba 289-290
+tests/test_menubar.py
+  s_51f06d0600a287::t_9b6b492cf9c75c 128-137
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4be43e18755ca9657e7ba1b33e996ca0c0da0d70",
+  "prompts": {},
+  "sessions": {
+    "s_51f06d0600a287": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f3dea-c608-7cb3-89a9-e551c8713c45",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "pencount <149122028+pencount@users.noreply.github.com>"
+    }
+  }
+}
