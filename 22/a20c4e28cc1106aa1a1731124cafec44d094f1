@@ -1,0 +1,22 @@
+src/claude_swap/menubar.py
+  s_51f06d0600a287::t_68a472252b3882 19,21,39-76,404,540,568-576,582,585,587,745
+tests/test_menubar.py
+  s_51f06d0600a287::t_fa069791d6d001 13,22-42
+  s_51f06d0600a287::t_94e0ceebd293ef 43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "22a20c4e28cc1106aa1a1731124cafec44d094f1",
+  "prompts": {},
+  "sessions": {
+    "s_51f06d0600a287": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f3dea-c608-7cb3-89a9-e551c8713c45",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "pencount <149122028+pencount@users.noreply.github.com>"
+    }
+  }
+}
