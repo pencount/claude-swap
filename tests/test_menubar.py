@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import plistlib
 from pathlib import Path
 
 from claude_swap import menubar
@@ -17,6 +18,28 @@ from claude_swap.switcher import USAGE_API_KEY
 
 
 # --- settings ------------------------------------------------------------------
+
+def test_notification_identity_creates_and_preserves_info_plist(tmp_path: Path):
+    executable = tmp_path / "bin" / "python3"
+    executable.parent.mkdir()
+    info = executable.parent / "Info.plist"
+    info.write_bytes(plistlib.dumps({"ExistingKey": "kept"}))
+
+    result = menubar.ensure_notification_identity(executable, platform="darwin")
+
+    assert result == info
+    data = plistlib.loads(info.read_bytes())
+    assert data["CFBundleIdentifier"] == "com.claude-swap.menubar"
+    assert data["CFBundleName"] == "claude-swap"
+    assert data["ExistingKey"] == "kept"
+
+
+def test_notification_identity_is_noop_off_macos(tmp_path: Path):
+    executable = tmp_path / "bin" / "python3"
+    assert menubar.ensure_notification_identity(
+        executable, platform="linux"
+    ) is None
+    assert not (executable.parent / "Info.plist").exists()
 
 def test_settings_defaults_when_file_missing(tmp_path: Path):
     s = menubar.MenuBarSettings.load(tmp_path / "nope.json")

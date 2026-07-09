@@ -16,7 +16,9 @@ unit-tested in CI; ``rumps`` is imported lazily inside the app glue.
 from __future__ import annotations
 
 import json
+import plistlib
 import re
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass, fields
@@ -34,6 +36,44 @@ REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95, 98)
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "model", "both", "all")
 SWITCH_HISTORY_LIMIT = 10
+NOTIFICATION_BUNDLE_ID = "com.claude-swap.menubar"
+
+
+def ensure_notification_identity(
+    executable: Path | None = None,
+    *,
+    platform: str = sys.platform,
+) -> Path | None:
+    """Ensure rumps can resolve a bundle identifier for notifications.
+
+    Command-line Python tools have no app bundle, so rumps looks for an
+    ``Info.plist`` beside the interpreter. uv/pipx reinstalls can recreate that
+    environment; repair the tiny plist on every launch when needed.
+    """
+    if platform != "darwin":
+        return None
+    path = (executable or Path(sys.executable)).parent / "Info.plist"
+    data: dict = {}
+    try:
+        if path.exists():
+            loaded = plistlib.loads(path.read_bytes())
+            if isinstance(loaded, dict):
+                data = loaded
+        changed = False
+        if not data.get("CFBundleIdentifier"):
+            data["CFBundleIdentifier"] = NOTIFICATION_BUNDLE_ID
+            changed = True
+        if not data.get("CFBundleName"):
+            data["CFBundleName"] = "claude-swap"
+            changed = True
+        if changed or not path.exists():
+            path.write_bytes(plistlib.dumps(data))
+    except (OSError, plistlib.InvalidFileException, ValueError) as exc:
+        logging.getLogger("claude-swap").warning(
+            "Could not prepare menu-bar notification identity: %s", exc
+        )
+        return None
+    return path
 
 
 @dataclass
@@ -361,6 +401,7 @@ def _adapt_snapshot(snap) -> dict:
 
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
+    ensure_notification_identity()
     import rumps  # lazy: optional dependency, imported only when launching
 
     from claude_swap.autoswitch import AutoSwitchEngine
@@ -496,7 +537,7 @@ def run(switcher) -> int:
                 )
             except Exception as e:  # never let a bad start crash the menu bar
                 self.switcher._logger.warning("auto-switch engine failed to start: %s", e)
-                rumps.notification("claude-swap", "Auto-switch failed to start", str(e))
+                self._notify("Auto-switch failed to start", str(e))
                 return
             self._engine = engine
             threading.Thread(target=self._run_engine, args=(engine,), daemon=True).start()
@@ -524,17 +565,26 @@ def run(switcher) -> int:
             with self._event_lock:
                 self._engine_events.append(event)
 
+        def _notify(self, title, message):
+            """Deliver a notification without breaking the main UI callback."""
+            try:
+                rumps.notification("claude-swap", title, message)
+            except RuntimeError as exc:
+                self.switcher._logger.warning(
+                    "menu-bar notification unavailable: %s", exc
+                )
+
         def _drain_engine_events(self):
             with self._event_lock:
                 events, self._engine_events = self._engine_events, []
             for ev in events:
                 if ev.kind == "switch" and not getattr(ev, "dry_run", False):
-                    rumps.notification("claude-swap", "Auto-switched account", ev.human())
+                    self._notify("Auto-switched account", ev.human())
                     self.refresh_async()  # reflect the switch promptly
                 elif ev.kind == "account-quarantined":
-                    rumps.notification("claude-swap", "Account quarantined", ev.human())
+                    self._notify("Account quarantined", ev.human())
                 elif ev.kind == "all-exhausted":
-                    rumps.notification("claude-swap", "All accounts exhausted", ev.human())
+                    self._notify("All accounts exhausted", ev.human())
 
         def _threshold(self) -> int:
             """Current auto-switch threshold from core settings (for the menu)."""
@@ -692,8 +742,7 @@ def run(switcher) -> int:
                 return False
 
         def _notify_switched(self):
-            rumps.notification(
-                "claude-swap",
+            self._notify(
                 "Account switched",
                 "Switch takes effect within ~30s — restart Claude Code to apply immediately.",
             )
