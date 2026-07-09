@@ -44,7 +44,7 @@ class AutoSwitchSettings:
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
-    strategy: str = "best"  # reserved for future strategies; only "best" in v1
+    strategy: str = "best"  # "best" or "safe-burn"
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus").
@@ -104,7 +104,8 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             help="A target must sit this many pct below the threshold",
         ),
         SettingSpec(
-            "autoswitch", "strategy", "strategy", "choice", choices=("best",),
+            "autoswitch", "strategy", "strategy", "choice",
+            choices=("best", "safe-burn"),
             help="How auto-switch picks the target account",
         ),
         SettingSpec(
@@ -371,6 +372,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("interval", "interval_seconds"),
         ("cooldown", "cooldown_seconds"),
         ("include_api_key_accounts", "include_api_key_accounts"),
+        ("strategy", "strategy"),
         ("model", "model"),
     ):
         value = getattr(args, attr, None)

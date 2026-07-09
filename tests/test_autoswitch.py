@@ -1125,6 +1125,27 @@ def _model_usage(five_h: float, fable: float) -> dict:
     }
 
 
+def _model_usage_with_reset(
+    five_h: float,
+    seven_day: float,
+    fable: float,
+    *,
+    seven_reset: str | None = None,
+    fable_reset: str | None = None,
+) -> dict:
+    seven: dict = {"pct": seven_day}
+    if seven_reset:
+        seven["resets_at"] = seven_reset
+    fable_entry: dict = {"name": "Fable", "pct": fable}
+    if fable_reset:
+        fable_entry["resets_at"] = fable_reset
+    return {
+        "five_hour": {"pct": five_h},
+        "seven_day": seven,
+        "scoped": [fable_entry],
+    }
+
+
 class TestModelAwareSwitch:
     """`autoswitch.model` folds a per-model weekly limit into the decision."""
 
@@ -1195,3 +1216,95 @@ class TestModelAwareSwitch:
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
+
+
+class TestSafeBurnStrategy:
+    """Prefer soonest model/weekly reset while keeping a threshold reserve."""
+
+    _SOON = "2026-07-08T03:00:00Z"
+    _LATER = "2026-07-09T03:00:00Z"
+    _LATEST = "2026-07-10T03:00:00Z"
+
+    def _seed(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="safe-burn", model="Fable", **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_below_threshold_switches_to_soonest_fable_reset(self, temp_home):
+        h = self._seed(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _model_usage_with_reset(5, 5, 20, fable_reset=self._LATER),
+            "2": _model_usage_with_reset(5, 5, 35, fable_reset=self._SOON),
+            "3": _model_usage_with_reset(5, 5, 10, fable_reset=self._LATEST),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "safe-burn"
+
+    def test_safe_burn_uses_fable_reset_before_account_weekly_reset(self, temp_home):
+        h = self._seed(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _model_usage_with_reset(
+                5, 5, 20,
+                seven_reset=self._LATER,
+                fable_reset=self._LATEST,
+            ),
+            "2": _model_usage_with_reset(
+                5, 5, 20,
+                seven_reset=self._SOON,
+                fable_reset=self._LATEST,
+            ),
+            "3": _model_usage_with_reset(
+                5, 5, 20,
+                seven_reset=self._LATEST,
+                fable_reset=self._SOON,
+            ),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_below_threshold_skips_earlier_candidate_without_reserve(self, temp_home):
+        h = self._seed(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _model_usage_with_reset(5, 5, 20, fable_reset=self._LATEST),
+            "2": _model_usage_with_reset(5, 5, 95, fable_reset=self._SOON),
+            "3": _model_usage_with_reset(5, 5, 40, fable_reset=self._LATER),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_stays_when_no_earlier_safe_deadline_exists(self, temp_home):
+        h = self._seed(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _model_usage_with_reset(5, 5, 20, fable_reset=self._SOON),
+            "2": _model_usage_with_reset(5, 5, 10, fable_reset=self._LATER),
+            "3": _model_usage_with_reset(5, 5, 95, fable_reset=self._SOON),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["already-safe-burning"]
+
+    def test_threshold_escape_prefers_safe_deadline_target(self, temp_home):
+        h = self._seed(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _model_usage_with_reset(5, 5, 92, fable_reset=self._LATEST),
+            "2": _model_usage_with_reset(5, 5, 91, fable_reset=self._SOON),
+            "3": _model_usage_with_reset(5, 5, 40, fable_reset=self._LATER),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_at_limit_falls_back_to_best_headroom_when_resets_unknown(self, temp_home):
+        h = self._seed(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _model_usage_with_reset(5, 5, 100),
+            "2": _model_usage_with_reset(5, 5, 40),
+            "3": _model_usage_with_reset(5, 5, 20),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3

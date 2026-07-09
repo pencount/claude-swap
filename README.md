@@ -86,6 +86,7 @@ cswap auto                     # foreground loop, polls every 60s
 cswap auto --threshold 80      # switch earlier
 cswap auto --model Fable       # also switch when the Fable weekly limit is hit
 cswap auto --model Fable,Opus  # ...or any of several models
+cswap auto --strategy safe-burn # prefer expiring model/weekly quota, with reserve
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
 ```
@@ -100,6 +101,7 @@ cswap auto --dry-run           # log what it would do, never switch
 - An account whose refresh token has died is quarantined and reported until you log in with it and re-run `cswap add --slot N`. API-key accounts are never rotated onto unless you pass `--include-api-key-accounts`.
 - By default only the account-wide 5h/7d windows drive switching. If you work on one model and hit its **weekly per-model limit** first (e.g. Fable), add `--model Fable` (or `cswap config set autoswitch.model Fable`) to fold that model's window into the decision, so it switches off an account whose model quota is spent even while its 5h/7d windows still have room. Pass several as a comma-separated list — `--model Fable,Opus` — to switch when **any** of them is maxed.
   - **Model names** are Anthropic's own per-model `display_name`s, matched case-insensitively. The exact strings for your accounts are the per-model rows in `cswap --list` (e.g. a line reading `Fable: 100%`). At the time of writing the values seen are `Fable`, `Opus`, `Sonnet`, and `Haiku`, but the list follows whatever the usage API reports — a name that never matches simply has no effect.
+- Strategies (`--strategy`, or `cswap config set autoswitch.strategy`): `best` (default) stays put until the active account nears its binding limit, then moves to the account with the most headroom. `safe-burn` prefers the account whose configured model/weekly quota resets soonest, but still leaves accounts at the threshold so long Fable turns keep a reserve. With `--model Fable`, safe-burn ranks by Fable reset when present and falls back to the account-wide 7d reset.
 
 For cron/systemd timers, `--once` reports the outcome in its exit code (`0` switched, `1` error, `2` nothing to do, `3` blocked — no viable target), and `--json` emits one JSON event per line:
 
@@ -214,6 +216,7 @@ cswap config                              # list effective settings ("(default)"
 cswap config get autoswitch.threshold
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
+cswap config set autoswitch.strategy safe-burn  # use expiring model/weekly quota first
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```

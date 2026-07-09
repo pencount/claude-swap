@@ -8,18 +8,21 @@ human lines or JSONL, and any future frontend (TUI dashboard, menubar) can
 consume the same stream.
 
 Policy in one paragraph: when the active account's *binding window* (the
-higher of its 5h/7d utilization) crosses ``settings.threshold``, switch to
-the candidate with the most headroom — proactively, so the old account is
-still valid while a running Claude Code picks the new one up (this is what
-makes the macOS ~30s Keychain cache latency harmless). Candidates must sit
-``hysteresis_pct`` below the threshold so two accounts hovering at the line
-never ping-pong, and a ``cooldown_seconds`` floor bounds the switch rate
-(bypassed only when the active account is hard at its limit). Before
-activation the target's token is *freshened* (refreshed if it expires within
-10 minutes — twice Claude Code's refresh buffer, so a running Claude Code's
-under-lock re-read sees a fresh token and aborts its own refresh); a target
-whose refresh token is dead gets quarantined instead of activated. When the
-active account's own usage becomes unreadable for ``unhealthy_ticks``
+higher of its 5h/7d utilization, plus configured per-model windows) crosses
+``settings.threshold``, switch to another account proactively, so the old
+account is still valid while a running Claude Code picks the new one up (this
+is what makes the macOS ~30s Keychain cache latency harmless). The default
+``best`` strategy picks the candidate with the most headroom. ``safe-burn``
+prefers the soonest-resetting configured model/weekly quota, but still leaves
+at the threshold to preserve a safety reserve. Candidates must sit
+``hysteresis_pct`` below the threshold in the default strategy so two accounts
+hovering at the line never ping-pong, and a ``cooldown_seconds`` floor bounds
+the switch rate (bypassed only when the active account is hard at its limit).
+Before activation the target's token is *freshened* (refreshed if it expires
+within 10 minutes — twice Claude Code's refresh buffer, so a running Claude
+Code's under-lock re-read sees a fresh token and aborts its own refresh); a
+target whose refresh token is dead gets quarantined instead of activated. When
+the active account's own usage becomes unreadable for ``unhealthy_ticks``
 consecutive ticks, the engine fails over to any healthy candidate.
 
 Cooldown and quarantine persist in ``<backup_root>/autoswitch_state.json``
@@ -36,7 +39,7 @@ import logging
 import random
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -323,21 +326,45 @@ def _refresh_fingerprint(credentials: str) -> str | None:
     return "sha256:" + hashlib.sha256(token.encode()).hexdigest()
 
 
-def binding_pct(usage: dict | None) -> float | None:
-    """Utilization of the binding (higher) 5h/7d window, or None."""
-    headroom = oauth.account_headroom(usage)
+def binding_pct(usage: dict | None, models: Sequence[str] = ()) -> float | None:
+    """Utilization of the binding 5h/7d/model window, or None."""
+    headroom = oauth.account_headroom(usage, models)
     return None if headroom is None else 100.0 - headroom
 
 
-def _limiting_reset_ts(usage: dict | None) -> float | None:
+def _model_windows(usage: dict, models: Sequence[str]) -> list[dict]:
+    """Scoped windows matching configured model display names."""
+    if not models:
+        return []
+    scoped = usage.get("scoped")
+    if not isinstance(scoped, list):
+        return []
+    wanted = {m.lower() for m in models}
+    return [
+        w for w in scoped
+        if isinstance(w, dict)
+        and isinstance(w.get("name"), str)
+        and w["name"].lower() in wanted
+    ]
+
+
+def _quota_windows(usage: dict, models: Sequence[str] = ()) -> list[dict]:
+    windows = [
+        w for w in (usage.get("five_hour"), usage.get("seven_day"))
+        if isinstance(w, dict)
+    ]
+    windows.extend(_model_windows(usage, models))
+    return windows
+
+
+def _limiting_reset_ts(
+    usage: dict | None, models: Sequence[str] = ()
+) -> float | None:
     """Epoch when the last of the ≥100% windows resets (account usable again)."""
     if not isinstance(usage, dict):
         return None
     latest: float | None = None
-    for key in ("five_hour", "seven_day"):
-        window = usage.get(key)
-        if not isinstance(window, dict):
-            continue
+    for window in _quota_windows(usage, models):
         pct = window.get("pct")
         if not isinstance(pct, (int, float)) or pct < 100.0:
             continue
@@ -347,15 +374,14 @@ def _limiting_reset_ts(usage: dict | None) -> float | None:
     return latest
 
 
-def _earliest_future_reset_ts(usage: dict | None, now: float) -> float | None:
+def _earliest_future_reset_ts(
+    usage: dict | None, now: float, models: Sequence[str] = ()
+) -> float | None:
     """Epoch of the next window reset still ahead of ``now``, any utilization."""
     if not isinstance(usage, dict):
         return None
     earliest: float | None = None
-    for key in ("five_hour", "seven_day"):
-        window = usage.get(key)
-        if not isinstance(window, dict):
-            continue
+    for window in _quota_windows(usage, models):
         ts = _window_reset_ts(window)
         if ts is not None and ts > now and (earliest is None or ts < earliest):
             earliest = ts
@@ -372,6 +398,34 @@ def _window_reset_ts(window: dict) -> float | None:
         ).timestamp()
     except ValueError:
         return None
+
+
+def _deadline_reset_ts(usage: dict | str | None, models: Sequence[str]) -> float | None:
+    """Reset timestamp used by safe-burn ordering.
+
+    If a model filter is configured, prefer the matching scoped model reset.
+    Otherwise, or when the scoped reset is absent, fall back to the account's
+    weekly 7-day reset. The short 5-hour window still gates headroom but is not
+    the perishable weekly inventory safe-burn is trying to spend.
+    """
+    if not isinstance(usage, dict):
+        return None
+    scoped_resets = [
+        ts for ts in (_window_reset_ts(w) for w in _model_windows(usage, models))
+        if ts is not None
+    ]
+    if scoped_resets:
+        return min(scoped_resets)
+    seven_day = usage.get("seven_day")
+    if isinstance(seven_day, dict):
+        return _window_reset_ts(seven_day)
+    return None
+
+
+def _deadline_is_sooner(candidate: float | None, active: float | None) -> bool:
+    if candidate is None:
+        return False
+    return active is None or candidate < active
 
 
 def _ref(number: str, email: str) -> dict:
@@ -635,19 +689,23 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         active_headroom = headroom.get(current)
+        safe_burn = settings.strategy == "safe-burn"
         if active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
             if utilization < settings.threshold:
-                self._emit(
-                    NoSwitchEvent(
-                        reason="below-threshold",
-                        detail=f"{utilization:.0f}% < {settings.threshold:.0f}%",
+                if not safe_burn:
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="below-threshold",
+                            detail=f"{utilization:.0f}% < {settings.threshold:.0f}%",
+                        )
                     )
-                )
-                return TickOutcome.NO_ACTION
-            trigger = "at-limit" if active_headroom <= 0 else "proactive"
+                    return TickOutcome.NO_ACTION
+                trigger = "safe-burn"
+            else:
+                trigger = "at-limit" if active_headroom <= 0 else "proactive"
         else:
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
                 # Expired while an owner (Claude Code / live session) holds the
@@ -696,7 +754,7 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger == "proactive" and self._in_cooldown(state):
+        if trigger in ("proactive", "safe-burn") and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -722,7 +780,11 @@ class AutoSwitchEngine:
             return TickOutcome.BLOCKED
 
         hysteresis_bar = settings.threshold - settings.hysteresis_pct
-        qualifying: list[tuple[float, str]] = []
+        active_deadline = (
+            _deadline_reset_ts(usage.get(current), self._models)
+            if safe_burn else None
+        )
+        qualifying: list[tuple[tuple, str]] = []
         any_known = False
         for num in oauth_candidates:
             h = headroom.get(num)
@@ -731,6 +793,38 @@ class AutoSwitchEngine:
             any_known = True
             if h <= 0:
                 continue  # itself at its limit — never a target
+            utilization = 100.0 - h
+            if safe_burn:
+                reset_ts = _deadline_reset_ts(usage.get(num), self._models)
+                if trigger == "safe-burn":
+                    # Below-threshold burn-down only moves to a strictly
+                    # earlier weekly/model reset, and only while the target
+                    # still has the configured safety reserve.
+                    if utilization >= settings.threshold:
+                        continue
+                    if not _deadline_is_sooner(reset_ts, active_deadline):
+                        continue
+                elif trigger == "proactive":
+                    # Once active crosses the safety threshold, leave it only
+                    # for another account still below that same threshold.
+                    if utilization >= settings.threshold:
+                        continue
+                safe_target = utilization < settings.threshold
+                if trigger in ("at-limit", "failover"):
+                    # Escapes may use any positive-headroom target, but rank
+                    # below-threshold targets first.
+                    key = (
+                        0 if safe_target else 1,
+                        reset_ts if reset_ts is not None else float("inf"),
+                        -h,
+                    )
+                else:
+                    key = (
+                        reset_ts if reset_ts is not None else float("inf"),
+                        -h,
+                    )
+                qualifying.append((key, num))
+                continue
             if trigger == "proactive":
                 # Hysteresis guards only the proactive case: two accounts
                 # hovering at the line must not ping-pong. At-limit and
@@ -741,15 +835,23 @@ class AutoSwitchEngine:
                     continue
                 if active_headroom is not None and h <= active_headroom:
                     continue  # not provably better than where we are
-            qualifying.append((h, num))
-        # Best headroom first; list order (sequence order) breaks ties.
-        qualifying.sort(key=lambda t: -t[0])
+            qualifying.append(((-h,), num))
+        # Ascending by each strategy's key; list order (sequence order) breaks ties.
+        qualifying.sort(key=lambda t: t[0])
         ordered = [num for _, num in qualifying]
-        if not ordered and api_key_candidates:
+        if not ordered and api_key_candidates and trigger != "safe-burn":
             # Last resort: metered API-key accounts (unmeasurable headroom).
             ordered = api_key_candidates
 
         if not ordered:
+            if trigger == "safe-burn":
+                self._emit(
+                    NoSwitchEvent(
+                        reason="already-safe-burning",
+                        detail="active account has the soonest safe reset",
+                    )
+                )
+                return TickOutcome.NO_ACTION
             if not any_known:
                 self._emit(
                     NoSwitchEvent(
@@ -780,7 +882,7 @@ class AutoSwitchEngine:
                 )
                 return TickOutcome.BLOCKED
             self._blocked_wait_long = True
-            earliest = self._earliest_reset(usage)
+            earliest = self._earliest_reset(usage, self._models)
             if earliest is not None:
                 self._sleep_until_ts = earliest.timestamp() + RESET_SLACK_S
             self._emit(
@@ -880,8 +982,14 @@ class AutoSwitchEngine:
         active_headroom = oauth.account_headroom(
             active_value if isinstance(active_value, dict) else None, self._models
         )
+        safe_burn = self.settings.strategy == "safe-burn"
         escalate = bool(candidates) and (
-            (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
+            (
+                safe_burn
+                and active_headroom is not None
+                and active_value != USAGE_TOKEN_EXPIRED
+            )
+            or (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
             or (
                 active_headroom is not None
                 and 100.0 - active_headroom
@@ -916,7 +1024,7 @@ class AutoSwitchEngine:
         escalation are enforced elsewhere and unaffected.
         """
         interval = float(self.settings.interval_seconds)
-        pct = binding_pct(entry.last_good)
+        pct = binding_pct(entry.last_good, self._models)
         if pct is None:
             return interval
         distance = (self.settings.threshold - ESCALATION_MARGIN_PCT) - pct
@@ -952,8 +1060,8 @@ class AutoSwitchEngine:
             if after.fetched_at is None or after.fetched_at == before.fetched_at:
                 continue  # not fetched this pass
             base = before.poll_interval_s or self.settings.interval_seconds
-            prev_pct = binding_pct(before.last_good)
-            new_pct = binding_pct(after.last_good)
+            prev_pct = binding_pct(before.last_good, self._models)
+            new_pct = binding_pct(after.last_good, self._models)
             if prev_pct is None or new_pct is None:
                 interval = self.settings.interval_seconds
             elif abs(new_pct - prev_pct) >= MOVEMENT_DELTA_PCT:
@@ -961,13 +1069,15 @@ class AutoSwitchEngine:
             else:
                 interval = min(CANDIDATE_MAX_INTERVAL_S, base * 1.5)
             next_poll = now + interval
-            headroom = oauth.account_headroom(after.last_good)
+            headroom = oauth.account_headroom(after.last_good, self._models)
             if headroom is not None and headroom <= 0:
-                reset_ts = _limiting_reset_ts(after.last_good)
+                reset_ts = _limiting_reset_ts(after.last_good, self._models)
                 if reset_ts is not None and reset_ts > next_poll:
                     next_poll = reset_ts
             else:
-                reset_ts = _earliest_future_reset_ts(after.last_good, now)
+                reset_ts = _earliest_future_reset_ts(
+                    after.last_good, now, self._models
+                )
                 if reset_ts is not None:
                     next_poll = min(next_poll, reset_ts + RESET_SLACK_S)
             plans[num] = (next_poll, interval)
@@ -1034,14 +1144,16 @@ class AutoSwitchEngine:
         return (self.clock() - last) < self.settings.cooldown_seconds
 
     @staticmethod
-    def _earliest_reset(usage: dict[str, dict | str | None]) -> datetime | None:
+    def _earliest_reset(
+        usage: dict[str, dict | str | None], models: Sequence[str] = ()
+    ) -> datetime | None:
         """Earliest known window reset across all accounts (UTC)."""
         earliest: datetime | None = None
         for entry in usage.values():
             if not isinstance(entry, dict):
                 continue
-            for window in ("five_hour", "seven_day"):
-                resets_at = (entry.get(window) or {}).get("resets_at")
+            for window in _quota_windows(entry, models):
+                resets_at = window.get("resets_at")
                 if not resets_at:
                     continue
                 try:

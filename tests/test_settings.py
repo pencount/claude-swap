@@ -30,6 +30,7 @@ def _args(**kwargs) -> argparse.Namespace:
         "interval": None,
         "cooldown": None,
         "include_api_key_accounts": None,
+        "strategy": None,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -83,6 +84,12 @@ class TestLoadSettings:
             json.dumps({"autoswitch": {"strategy": "chaos"}})
         )
         assert load_settings(tmp_path).strategy == "best"
+
+    def test_safe_burn_is_a_valid_strategy(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"strategy": "safe-burn"}})
+        )
+        assert load_settings(tmp_path).strategy == "safe-burn"
 
 
 class TestSaveSettings:
@@ -144,6 +151,10 @@ class TestSetUnsetSetting:
     def test_set_rejects_unknown_key(self, tmp_path: Path):
         with pytest.raises(ConfigError, match="unknown setting"):
             set_setting(tmp_path, "autoswitch.bogus", "1")
+
+    def test_set_strategy_safe_burn(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.strategy", "safe-burn")
+        assert load_settings(tmp_path).strategy == "safe-burn"
 
     def test_set_string_kind_round_trips(self, tmp_path: Path):
         assert set_setting(tmp_path, "autoswitch.model", "Fable") == "Fable"
@@ -230,3 +241,9 @@ class TestMergedWithCli:
     def test_model_override(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(model="Fable"))
         assert merged.model == "Fable"
+
+    def test_strategy_override(self):
+        merged = merged_with_cli(
+            AutoSwitchSettings(), _args(strategy="safe-burn")
+        )
+        assert merged.strategy == "safe-burn"
