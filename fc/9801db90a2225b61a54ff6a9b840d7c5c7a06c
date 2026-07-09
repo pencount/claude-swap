@@ -1,0 +1,39 @@
+tests/test_settings.py
+  s_51f06d0600a287::t_b174d10530b32d 33,88-93,244-249
+  s_51f06d0600a287::t_5278236b447a3d 155-158
+tests/test_config_cli.py
+  s_51f06d0600a287::t_d27b5a6a175b82 176
+src/claude_swap/settings.py
+  s_51f06d0600a287::t_9c29e5640785f1 47,107-108,375
+src/claude_swap/cli.py
+  s_51f06d0600a287::t_bce09e2eac8954 215,272-279
+  s_51f06d0600a287::t_ec59090af721ed 280-281
+src/claude_swap/autoswitch.py
+  s_51f06d0600a287::t_849ca64b308e2a 692,698-703,705-708,757,783-787,796-827,838-840,842,847-854
+  s_51f06d0600a287::t_e77df83e74c7b6 42,329-331,335-362,367,377-379,384,403-428
+  s_51f06d0600a287::t_7a8a6ab17970ff 985,987-992,1027,1063-1064,1072,1074,1078-1080
+  s_51f06d0600a287::t_4a7c15c0239790 885,1147-1149,1155-1156
+  s_51f06d0600a287::t_bc9c1ffc13c7fc 11-25
+  s_51f06d0600a287::t_1dbbb674ca457d 429-430
+tests/test_autoswitch.py
+  s_51f06d0600a287::t_fd2fed36c42b11 1128-1148,1219-1241,1245-1310
+  s_51f06d0600a287::t_7549a21cb29fc2 1242-1244
+README.md
+  s_51f06d0600a287::t_87219cca05f7b7 89,104,219
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fc9801db90a2225b61a54ff6a9b840d7c5c7a06c",
+  "prompts": {},
+  "sessions": {
+    "s_51f06d0600a287": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f3dea-c608-7cb3-89a9-e551c8713c45",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "pencount <149122028+pencount@users.noreply.github.com>"
+    }
+  }
+}
