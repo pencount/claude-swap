@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1308,3 +1309,201 @@ class TestSafeBurnStrategy:
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
+
+
+class TestDeadlineDrain:
+    """Relax only configured model reserve as its reset approaches."""
+
+    def _seed(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(
+            temp_home,
+            strategy="safe-burn",
+            model="Fable",
+            threshold=85,
+            drain_window_hours=12,
+            drain_threshold=98,
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        h.clock.now = datetime(2030, 1, 1, tzinfo=timezone.utc).timestamp()
+        return h
+
+    @staticmethod
+    def _reset(h: EngineHarness, hours: float) -> str:
+        return datetime.fromtimestamp(
+            h.clock.now + hours * 3600,
+            tz=timezone.utc,
+        ).isoformat()
+
+    def test_halfway_through_drain_window_raises_only_model_threshold(self, temp_home):
+        h = self._seed(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _model_usage_with_reset(
+                20, 5, 90, fable_reset=self._reset(h, 6)
+            ),
+            "2": _model_usage_with_reset(
+                20, 5, 10, fable_reset=self._reset(h, 18)
+            ),
+            "3": _model_usage_with_reset(
+                20, 5, 10, fable_reset=self._reset(h, 24)
+            ),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        poll = next(event for event in h.events if isinstance(event, PollEvent))
+        assert poll.active_window == "Fable"
+        assert poll.active_utilization == 90
+        assert poll.threshold == 85
+        assert poll.effective_threshold == pytest.approx(91.5)
+        assert poll.to_json()["threshold"] == 85
+        assert poll.to_json()["effectiveThreshold"] == pytest.approx(91.5)
+
+    def test_outside_drain_window_uses_base_model_threshold(self, temp_home):
+        h = self._seed(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _model_usage_with_reset(
+                20, 5, 90, fable_reset=self._reset(h, 13)
+            ),
+            "2": _model_usage_with_reset(
+                20, 5, 10, fable_reset=self._reset(h, 18)
+            ),
+            "3": _model_usage_with_reset(
+                20, 5, 20, fable_reset=self._reset(h, 24)
+            ),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        poll = next(event for event in h.events if isinstance(event, PollEvent))
+        assert poll.threshold == 85
+        assert poll.effective_threshold == 85
+
+    def test_normal_five_hour_window_never_uses_drain_threshold(self, temp_home):
+        h = self._seed(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _model_usage_with_reset(
+                86, 5, 90, fable_reset=self._reset(h, 6)
+            ),
+            "2": _model_usage_with_reset(
+                20, 5, 10, fable_reset=self._reset(h, 18)
+            ),
+            "3": _model_usage_with_reset(
+                20, 5, 20, fable_reset=self._reset(h, 24)
+            ),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        poll = next(event for event in h.events if isinstance(event, PollEvent))
+        assert poll.active_window == "5h"
+        assert poll.threshold == 85
+        assert poll.effective_threshold == 85
+
+    def test_safe_burn_revisits_earlier_account_as_reserve_opens(self, temp_home):
+        h = self._seed(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _model_usage_with_reset(
+                20, 5, 20, fable_reset=self._reset(h, 24)
+            ),
+            # Three hours remain: threshold has ramped to 94.75%, so this
+            # previously parked account is safe to revisit and drain further.
+            "2": _model_usage_with_reset(
+                20, 5, 92, fable_reset=self._reset(h, 3)
+            ),
+            "3": _model_usage_with_reset(
+                20, 5, 10, fable_reset=self._reset(h, 12)
+            ),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_candidate_above_its_ramped_threshold_is_skipped(self, temp_home):
+        h = self._seed(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _model_usage_with_reset(
+                20, 5, 20, fable_reset=self._reset(h, 24)
+            ),
+            "2": _model_usage_with_reset(
+                20, 5, 96, fable_reset=self._reset(h, 3)
+            ),
+            "3": _model_usage_with_reset(
+                20, 5, 40, fable_reset=self._reset(h, 6)
+            ),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_account_wide_weekly_limit_still_blocks_drain_candidate(self, temp_home):
+        h = self._seed(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _model_usage_with_reset(
+                20, 5, 20, fable_reset=self._reset(h, 24)
+            ),
+            "2": _model_usage_with_reset(
+                20, 86, 92, fable_reset=self._reset(h, 3)
+            ),
+            "3": _model_usage_with_reset(
+                20, 5, 40, fable_reset=self._reset(h, 6)
+            ),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_each_configured_model_keeps_its_own_threshold(self, temp_home):
+        h = EngineHarness(
+            temp_home,
+            strategy="safe-burn",
+            model="Fable,Opus",
+            threshold=85,
+            drain_window_hours=12,
+            drain_threshold=98,
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        h.clock.now = datetime(2030, 1, 1, tzinfo=timezone.utc).timestamp()
+
+        def usage(fable: float, opus: float, fable_hours: float, opus_hours: float):
+            return {
+                "five_hour": {"pct": 20},
+                "seven_day": {"pct": 5},
+                "scoped": [
+                    {
+                        "name": "Fable",
+                        "pct": fable,
+                        "resets_at": self._reset(h, fable_hours),
+                    },
+                    {
+                        "name": "Opus",
+                        "pct": opus,
+                        "resets_at": self._reset(h, opus_hours),
+                    },
+                ],
+            }
+
+        outcome = h.tick_with_usage({
+            # Fable 90% is safe at its halfway threshold of 91.5%, but Opus
+            # remains outside its drain window and crosses the base 85% limit.
+            "1": usage(90, 86, 6, 24),
+            "2": usage(10, 10, 18, 18),
+            "3": usage(20, 20, 24, 24),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        poll = next(event for event in h.events if isinstance(event, PollEvent))
+        assert poll.active_window == "Opus"
+        assert poll.effective_threshold == 85
+
+    def test_drain_ceiling_holds_through_reset_slack(self, temp_home):
+        h = self._seed(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _model_usage_with_reset(
+                20, 5, 97, fable_reset=self._reset(h, -0.01)
+            ),
+            "2": _model_usage_with_reset(
+                20, 5, 10, fable_reset=self._reset(h, 18)
+            ),
+            "3": _model_usage_with_reset(
+                20, 5, 20, fable_reset=self._reset(h, 24)
+            ),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        poll = next(event for event in h.events if isinstance(event, PollEvent))
+        assert poll.effective_threshold == 98

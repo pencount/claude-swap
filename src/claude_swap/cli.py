@@ -213,6 +213,7 @@ Examples:
   cswap auto --threshold 80        # switch earlier
   cswap auto --model Fable         # also switch when the Fable weekly limit is hit
   cswap auto --strategy safe-burn  # prefer soonest-resetting Fable/weekly quota
+  cswap auto --drain-window 12     # relax only Fable's reserve near its reset
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
   cswap auto --dry-run             # log decisions, never actually switch
@@ -261,6 +262,24 @@ Defaults live in settings.json in the backup root; flags override them.
         ),
     )
     parser.add_argument(
+        "--drain-window",
+        type=float,
+        metavar="HOURS",
+        help=(
+            "With safe-burn, linearly relax configured model reserve during "
+            "the final HOURS before reset (0 disables; 5h/7d stay protected)"
+        ),
+    )
+    parser.add_argument(
+        "--drain-threshold",
+        type=float,
+        metavar="PCT",
+        help=(
+            "Configured-model threshold reached just before reset during "
+            "the drain window (50-99.9; default 98)"
+        ),
+    )
+    parser.add_argument(
         "--include-api-key-accounts",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -276,7 +295,7 @@ Defaults live in settings.json in the backup root; flags override them.
         help=(
             "Target selection: 'best' (most quota left; default) or "
             "'safe-burn' (prefer the soonest-resetting configured model/weekly "
-            "quota, while leaving at the threshold)"
+            "quota, while preserving the active safety threshold)"
         ),
     )
     parser.add_argument(

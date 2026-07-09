@@ -23,13 +23,15 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime
 from pathlib import Path
 
+from claude_swap import oauth
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.switcher import SENTINEL_NOTES
+from claude_swap.tui.data import format_age as format_usage_age
 
 ICON = "⇄"
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95, 98)
-TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
+TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "model", "both", "all")
 SWITCH_HISTORY_LIMIT = 10
 
 
@@ -139,7 +141,11 @@ def _live_countdown(window: dict | str | None, now: float) -> str | None:
     return f"{minutes}m"
 
 
-def usage_summary(usage: dict | str | None, now: float | None = None) -> str:
+def usage_summary(
+    usage: dict | str | None,
+    now: float | None = None,
+    models: tuple[str, ...] = (),
+) -> str:
     """One-line usage summary for an account row (reset countdown computed live)."""
     if isinstance(usage, str):
         return usage
@@ -156,6 +162,15 @@ def usage_summary(usage: dict | str | None, now: float | None = None) -> str:
             if countdown:
                 seg += f" ({countdown})"  # time until this window resets
             parts.append(seg)
+    for window in oauth.model_usage_windows(usage, models):
+        pct = window.get("pct")
+        if not isinstance(pct, (int, float)):
+            continue
+        seg = f"{window['name']} {pct:.0f}%"
+        countdown = _live_countdown(window, now)
+        if countdown:
+            seg += f" ({countdown})"
+        parts.append(seg)
     spend = usage.get("spend")
     if isinstance(spend, dict) and isinstance(spend.get("pct"), (int, float)):
         parts.append(f"$ {spend['pct']:.0f}%")
@@ -163,10 +178,19 @@ def usage_summary(usage: dict | str | None, now: float | None = None) -> str:
 
 
 def format_account_label(
-    num, email: str, usage: dict | str | None, now: float | None = None
+    num,
+    email: str,
+    usage: dict | str | None,
+    now: float | None = None,
+    models: tuple[str, ...] = (),
+    age_s: float | None = None,
 ) -> str:
     """Build one account row's menu label."""
-    return f"{num}  {email}  {usage_summary(usage, now)}"
+    label = f"{num}  {email}  {usage_summary(usage, now, models)}"
+    age = format_usage_age(age_s) if isinstance(usage, dict) else None
+    if age:
+        label += f" {age}"
+    return label
 
 
 def _local_part(email: str, limit: int = 12) -> str:
@@ -181,6 +205,7 @@ def format_title(
     active_email: str | None,
     active_usage: dict | str | None,
     settings: MenuBarSettings,
+    models: tuple[str, ...] = (),
 ) -> str:
     """Build the menu-bar title from the active account and settings."""
     if active_email is None:
@@ -188,20 +213,29 @@ def format_title(
     segments: list[str] = []
     if settings.show_account_name:
         segments.append(_local_part(active_email))
-    if settings.title_pct in ("5h", "both"):
+    if settings.title_pct in ("5h", "both", "all"):
         p = _window_pct(active_usage, "five_hour")
         if p is not None:
             segments.append(f"{p:.0f}%")
-    if settings.title_pct in ("7d", "both"):
+    if settings.title_pct in ("7d", "both", "all"):
         p = _window_pct(active_usage, "seven_day")
         if p is not None:
             segments.append(f"{p:.0f}%")
+    if settings.title_pct in ("model", "all"):
+        for window in oauth.model_usage_windows(active_usage, models):
+            pct = window.get("pct")
+            if isinstance(pct, (int, float)):
+                segments.append(f"{window['name']} {pct:.0f}%")
     if not segments:
         return ICON
     return f"{ICON} " + " · ".join(segments)
 
 
-def format_usage_log(email: str, usage: dict | str | None) -> str | None:
+def format_usage_log(
+    email: str,
+    usage: dict | str | None,
+    models: tuple[str, ...] = (),
+) -> str | None:
     """A log line of an account's session (5h) and weekly (7d) limits.
 
     Uses each window's absolute reset ``clock`` rather than a live countdown,
@@ -220,18 +254,39 @@ def format_usage_log(email: str, usage: dict | str | None) -> str | None:
         if clock:
             seg += f" (resets {clock})"
         parts.append(seg)
+    for window in oauth.model_usage_windows(usage, models):
+        pct = window.get("pct")
+        if not isinstance(pct, (int, float)):
+            continue
+        seg = f"{window['name']} {pct:.0f}%"
+        clock = window.get("clock")
+        if clock:
+            seg += f" (resets {clock})"
+        parts.append(seg)
     if not parts:
         return None
     return f"usage {email}: " + " · ".join(parts)
 
 
-def _usage_log_key(usage: dict | str | None) -> tuple[float | None, float | None]:
+def _usage_log_key(
+    usage: dict | str | None,
+    models: tuple[str, ...] = (),
+) -> tuple[float | None, ...]:
     """De-dupe key for usage logging: the (5h, 7d) percentages only.
 
     Reset clocks change every refresh; keying on the percentages means an idle
     account isn't re-logged every cycle.
     """
-    return (_window_pct(usage, "five_hour"), _window_pct(usage, "seven_day"))
+    model_pcts = tuple(
+        float(window["pct"])
+        for window in oauth.model_usage_windows(usage, models)
+        if isinstance(window.get("pct"), (int, float))
+    )
+    return (
+        _window_pct(usage, "five_hour"),
+        _window_pct(usage, "seven_day"),
+        *model_pcts,
+    )
 
 
 _SWITCH_LOG_RE = re.compile(r"Switched from account (\d+) to (\d+)")
@@ -272,7 +327,8 @@ EMPTY_SNAPSHOT: dict = {"accounts": [], "active_email": None, "active_usage": No
 def _adapt_snapshot(snap) -> dict:
     """Adapt an ``AccountsSnapshot`` to the menu bar's render dict.
 
-    Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good), ...],
+    Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good,
+    age_s), ...],
     "active_email": str | None, "active_usage": dict | str | None}``. The snapshot
     itself is produced by ``SnapshotSource`` (the paced read path), so this is a
     pure transform — no fetching, no I/O.
@@ -282,7 +338,14 @@ def _adapt_snapshot(snap) -> dict:
     active_usage = None
     for acc in snap.accounts:
         display = _account_display_usage(acc.usage)
-        accounts.append((acc.number, acc.email, acc.is_active, display, acc.usage.last_good))
+        accounts.append((
+            acc.number,
+            acc.email,
+            acc.is_active,
+            display,
+            acc.usage.last_good,
+            getattr(acc.usage, "age_s", None),
+        ))
         if acc.is_active:
             active_email, active_usage = acc.email, display
     return {
@@ -373,11 +436,12 @@ def run(switcher) -> int:
             but de-dupes per account on the (5h, 7d) percentages so an idle
             machine doesn't churn the rotating log with identical lines.
             """
-            for num, email, _is_active, _display, last_good in snap["accounts"]:
-                key = _usage_log_key(last_good)
+            models = self._models()
+            for num, email, _is_active, _display, last_good, _age_s in snap["accounts"]:
+                key = _usage_log_key(last_good, models)
                 if key == (None, None) or self._last_usage_log.get(num) == key:
                     continue
-                line = format_usage_log(email, last_good)
+                line = format_usage_log(email, last_good, models)
                 if line:
                     self.switcher._logger.info(line)
                     self._last_usage_log[num] = key
@@ -475,16 +539,29 @@ def run(switcher) -> int:
             except Exception:
                 return 0
 
+        def _models(self) -> tuple[str, ...]:
+            """Configured model names shared with the auto-switch engine."""
+            try:
+                return load_settings(self.switcher.backup_dir).models
+            except Exception:
+                return ()
+
         # ---- menu construction -----------------------------------------------
         def rebuild_menu(self):
+            models = self._models()
             self.title = format_title(
-                self.snapshot["active_email"], self.snapshot["active_usage"], self.settings
+                self.snapshot["active_email"],
+                self.snapshot["active_usage"],
+                self.settings,
+                models,
             )
             self.menu.clear()
             account_items = []
-            for num, email, is_active, display, _last_good in self.snapshot["accounts"]:
+            for num, email, is_active, display, _last_good, age_s in self.snapshot["accounts"]:
                 item = rumps.MenuItem(
-                    format_account_label(num, email, display),
+                    format_account_label(
+                        num, email, display, models=models, age_s=age_s
+                    ),
                     callback=self._make_switch_to(num),
                 )
                 item.state = 1 if is_active else 0
@@ -521,7 +598,7 @@ def run(switcher) -> int:
             accounts = self.snapshot["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
-            for num, email, _is_active, _display, _last_good in accounts:
+            for num, email, _is_active, _display, _last_good, _age_s in accounts:
                 menu.add(rumps.MenuItem(f"{num}  {email}", callback=self._make_remove(num)))
             return menu
 
@@ -548,8 +625,14 @@ def run(switcher) -> int:
             menu.add(name_item)
 
             title_pct = rumps.MenuItem("Title percentage")
-            tp_labels = {"off": "None", "5h": "Session (5h)",
-                         "7d": "Weekly (7d)", "both": "Both (5h · 7d)"}
+            tp_labels = {
+                "off": "None",
+                "5h": "Session (5h)",
+                "7d": "Weekly (7d)",
+                "model": "Configured model",
+                "both": "Both (5h · 7d)",
+                "all": "5h · 7d · configured model",
+            }
             for mode in TITLE_PCT_CHOICES:
                 ch = rumps.MenuItem(tp_labels[mode], callback=self._make_title_pct(mode))
                 ch.state = 1 if self.settings.title_pct == mode else 0

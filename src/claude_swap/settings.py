@@ -53,6 +53,21 @@ class AutoSwitchSettings:
     # exhausted even while its 5h/7d windows still have headroom. None =
     # account-wide 5h/7d only (default).
     model: str | None = None
+    # Optional safe-burn drain ramp for configured model windows. Zero hours
+    # disables it. During the final window, the model-only threshold rises
+    # linearly from ``threshold`` to ``drain_threshold``; 5h/7d keep the base
+    # threshold so draining weekly inventory never weakens session safety.
+    drain_window_hours: float = 0.0
+    drain_threshold: float = 98.0
+
+    @property
+    def models(self) -> tuple[str, ...]:
+        """Configured model display names, normalized from the CSV setting."""
+        return tuple(
+            model.strip()
+            for model in (self.model or "").split(",")
+            if model.strip()
+        )
 
 
 @dataclass(frozen=True)
@@ -119,6 +134,14 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable or Fable,Opus)",
+        ),
+        SettingSpec(
+            "autoswitch", "drainWindowHours", "drain_window_hours", "float", 0.0, 168.0,
+            help="Hours before a configured model reset to start relaxing its reserve",
+        ),
+        SettingSpec(
+            "autoswitch", "drainThreshold", "drain_threshold", "float", 50.0, 99.9,
+            help="Final configured-model threshold reached just before reset",
         ),
     )
 }
@@ -374,6 +397,8 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("strategy", "strategy"),
         ("model", "model"),
+        ("drain_window", "drain_window_hours"),
+        ("drain_threshold", "drain_threshold"),
     ):
         value = getattr(args, attr, None)
         if value is not None:

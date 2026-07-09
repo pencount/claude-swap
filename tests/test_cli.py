@@ -862,6 +862,18 @@ class TestAutoCommand:
         assert engine.settings.threshold == 60.0     # CLI wins
         assert engine.settings.cooldown_seconds == 42.0  # settings.json kept
 
+    def test_drain_flags_forwarded(self, temp_home):
+        self._run([
+            "--once",
+            "--strategy", "safe-burn",
+            "--model", "Fable",
+            "--drain-window", "12",
+            "--drain-threshold", "98",
+        ], temp_home)
+        settings = self.FakeEngine.instances[-1].settings
+        assert settings.drain_window_hours == 12.0
+        assert settings.drain_threshold == 98.0
+
     def test_dry_run_forwarded(self, temp_home):
         self._run(["--once", "--dry-run"], temp_home)
         assert self.FakeEngine.instances[-1].dry_run is True
@@ -900,6 +912,7 @@ class TestAutoCommand:
         assert excinfo.value.code == 0
         out = capsys.readouterr().out
         assert "--once" in out
+        assert "--drain-window" in out
         assert "Exit codes" in out
 
     def test_main_help_mentions_auto(self):

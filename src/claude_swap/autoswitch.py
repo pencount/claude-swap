@@ -14,7 +14,9 @@ account is still valid while a running Claude Code picks the new one up (this
 is what makes the macOS ~30s Keychain cache latency harmless). The default
 ``best`` strategy picks the candidate with the most headroom. ``safe-burn``
 prefers the soonest-resetting configured model/weekly quota, but still leaves
-at the threshold to preserve a safety reserve. Candidates must sit
+at the threshold to preserve a safety reserve. An optional deadline-aware
+drain ramp can relax only configured model windows near their weekly reset;
+the ordinary 5h/7d thresholds remain fixed. Candidates must sit
 ``hysteresis_pct`` below the threshold in the default strategy so two accounts
 hovering at the line never ping-pong, and a ``cooldown_seconds`` floor bounds
 the switch rate (bypassed only when the active account is hard at its limit).
@@ -148,6 +150,12 @@ class PollEvent(AutoSwitchEvent):
     # account number → last fetch-error cause ("http-429", "timeout", ...) for
     # accounts whose usage is unknown this tick. Additive field.
     fetch_errors: dict[str, str] = field(default_factory=dict)
+    # The quota window closest to its switch boundary. These additive fields
+    # make a model drain threshold intelligible when it differs from the base
+    # 5h/7d threshold.
+    active_utilization: float | None = None
+    active_window: str | None = None
+    effective_threshold: float | None = None
 
     def _fields(self) -> dict:
         fields = {
@@ -157,6 +165,12 @@ class PollEvent(AutoSwitchEvent):
         }
         if self.fetch_errors:
             fields["fetchErrors"] = self.fetch_errors
+        if self.active_utilization is not None:
+            fields["activeUtilizationPct"] = round(self.active_utilization, 1)
+        if self.active_window is not None:
+            fields["activeWindow"] = self.active_window
+        if self.effective_threshold is not None:
+            fields["effectiveThreshold"] = round(self.effective_threshold, 1)
         return fields
 
     def _describe(self, num: str) -> str:
@@ -171,7 +185,10 @@ class PollEvent(AutoSwitchEvent):
             return "poll: no active account"
         num = self.active.get("number")
         h = self.headroom.get(str(num))
-        if h is not None:
+        if self.active_utilization is not None:
+            label = f"{self.active_window} " if self.active_window else ""
+            used = f"{label}{self.active_utilization:.0f}% used"
+        elif h is not None:
             used = f"{100 - h:.0f}% used"
         else:
             err = self.fetch_errors.get(str(num))
@@ -182,9 +199,14 @@ class PollEvent(AutoSwitchEvent):
             if n != str(num)
         )
         tail = f" | others: {others}" if others else ""
+        boundary = (
+            self.effective_threshold
+            if self.effective_threshold is not None
+            else self.threshold
+        )
         return (
             f"Account-{num} ({self.active.get('email')}): {used} "
-            f"(switch at {self.threshold:.0f}%){tail}"
+            f"(switch at {boundary:.0f}%){tail}"
         )
 
 
@@ -334,18 +356,7 @@ def binding_pct(usage: dict | None, models: Sequence[str] = ()) -> float | None:
 
 def _model_windows(usage: dict, models: Sequence[str]) -> list[dict]:
     """Scoped windows matching configured model display names."""
-    if not models:
-        return []
-    scoped = usage.get("scoped")
-    if not isinstance(scoped, list):
-        return []
-    wanted = {m.lower() for m in models}
-    return [
-        w for w in scoped
-        if isinstance(w, dict)
-        and isinstance(w.get("name"), str)
-        and w["name"].lower() in wanted
-    ]
+    return oauth.model_usage_windows(usage, models)
 
 
 def _quota_windows(usage: dict, models: Sequence[str] = ()) -> list[dict]:
@@ -428,6 +439,89 @@ def _deadline_is_sooner(candidate: float | None, active: float | None) -> bool:
     return active is None or candidate < active
 
 
+@dataclass(frozen=True)
+class _QuotaThresholdState:
+    """The monitored window closest to crossing its applicable threshold."""
+
+    below: bool
+    utilization: float
+    threshold: float
+    window: str
+
+
+def _model_drain_threshold(
+    window: dict,
+    settings: AutoSwitchSettings,
+    now: float,
+) -> float:
+    """Effective threshold for one configured model window.
+
+    Only the model window ramps. The ordinary 5h and account-wide 7d windows
+    always retain ``settings.threshold`` so consuming expiring model inventory
+    cannot weaken the session safety boundary.
+    """
+    base = settings.threshold
+    duration = settings.drain_window_hours * 3600.0
+    reset_ts = _window_reset_ts(window)
+    if duration <= 0 or reset_ts is None:
+        return base
+    remaining = reset_ts - now
+    if remaining <= -RESET_SLACK_S or remaining > duration:
+        return base
+    ceiling = max(base, settings.drain_threshold)
+    if remaining <= 0:
+        return ceiling
+    progress = 1.0 - (remaining / duration)
+    return base + ((ceiling - base) * progress)
+
+
+def _quota_threshold_state(
+    usage: dict | str | None,
+    settings: AutoSwitchSettings,
+    models: Sequence[str],
+    now: float,
+    *,
+    allow_model_drain: bool,
+) -> _QuotaThresholdState | None:
+    """Compare each monitored quota against its own applicable threshold.
+
+    The critical window is the one with the smallest remaining percentage-
+    point margin. This differs from raw maximum utilization when a configured
+    model is inside its drain ramp, so callers use the returned utilization
+    and threshold together for decisions and reporting.
+    """
+    if not isinstance(usage, dict):
+        return None
+    checks: list[tuple[float, float, str]] = []
+    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+        window = usage.get(key)
+        pct = window.get("pct") if isinstance(window, dict) else None
+        if isinstance(pct, (int, float)):
+            checks.append((float(pct), settings.threshold, label))
+    for window in _model_windows(usage, models):
+        pct = window.get("pct")
+        if not isinstance(pct, (int, float)):
+            continue
+        threshold = (
+            _model_drain_threshold(window, settings, now)
+            if allow_model_drain
+            else settings.threshold
+        )
+        checks.append((float(pct), threshold, str(window["name"])))
+    if not checks:
+        return None
+    utilization, threshold, label = min(
+        checks,
+        key=lambda check: check[1] - check[0],
+    )
+    return _QuotaThresholdState(
+        below=all(pct < limit for pct, limit, _ in checks),
+        utilization=utilization,
+        threshold=threshold,
+        window=label,
+    )
+
+
 def _ref(number: str, email: str) -> dict:
     return {"number": int(number), "email": email}
 
@@ -457,9 +551,7 @@ class AutoSwitchEngine:
         # separated list ("Fable", "Opus,Sonnet", ...); split once here and
         # pass to every account_headroom call so active and candidates are
         # judged on the same axes.
-        self._models = tuple(
-            m.strip() for m in (settings.model or "").split(",") if m.strip()
-        )
+        self._models = settings.models
         self.on_event = on_event
         self.dry_run = dry_run
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
@@ -663,6 +755,15 @@ class AutoSwitchEngine:
         }
 
         entries, usage, headroom = self._collect_scheduled_usage(current, quarantined)
+        safe_burn = settings.strategy == "safe-burn"
+        now = self.clock()
+        active_gate = _quota_threshold_state(
+            usage.get(current),
+            settings,
+            self._models,
+            now,
+            allow_model_drain=safe_burn,
+        )
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -673,6 +774,13 @@ class AutoSwitchEngine:
                     for num, entry in entries.items()
                     if usage.get(num) is None and entry.last_error
                 },
+                active_utilization=(
+                    active_gate.utilization if active_gate else None
+                ),
+                active_window=active_gate.window if active_gate else None,
+                effective_threshold=(
+                    active_gate.threshold if active_gate else None
+                ),
             )
         )
 
@@ -689,23 +797,39 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         active_headroom = headroom.get(current)
-        safe_burn = settings.strategy == "safe-burn"
         if active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
-            utilization = 100.0 - active_headroom
-            if utilization < settings.threshold:
+            utilization = (
+                active_gate.utilization
+                if active_gate is not None
+                else 100.0 - active_headroom
+            )
+            switch_threshold = (
+                active_gate.threshold if active_gate is not None else settings.threshold
+            )
+            below_threshold = (
+                active_gate.below
+                if active_gate is not None
+                else utilization < settings.threshold
+            )
+            if active_headroom <= 0:
+                trigger = "at-limit"
+            elif below_threshold:
                 if not safe_burn:
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
-                            detail=f"{utilization:.0f}% < {settings.threshold:.0f}%",
+                            detail=(
+                                f"{active_gate.window + ' ' if active_gate else ''}"
+                                f"{utilization:.0f}% < {switch_threshold:.0f}%"
+                            ),
                         )
                     )
                     return TickOutcome.NO_ACTION
                 trigger = "safe-burn"
             else:
-                trigger = "at-limit" if active_headroom <= 0 else "proactive"
+                trigger = "proactive"
         else:
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
                 # Expired while an owner (Claude Code / live session) holds the
@@ -796,25 +920,38 @@ class AutoSwitchEngine:
             utilization = 100.0 - h
             if safe_burn:
                 reset_ts = _deadline_reset_ts(usage.get(num), self._models)
+                candidate_gate = _quota_threshold_state(
+                    usage.get(num),
+                    settings,
+                    self._models,
+                    now,
+                    allow_model_drain=True,
+                )
+                candidate_safe = (
+                    candidate_gate.below
+                    if candidate_gate is not None
+                    else utilization < settings.threshold
+                )
                 if trigger == "safe-burn":
                     # Below-threshold burn-down only moves to a strictly
                     # earlier weekly/model reset, and only while the target
-                    # still has the configured safety reserve.
-                    if utilization >= settings.threshold:
+                    # still has its applicable safety reserve. A configured
+                    # model may be in its deadline-aware drain ramp, while
+                    # normal 5h/7d windows always retain the base threshold.
+                    if not candidate_safe:
                         continue
                     if not _deadline_is_sooner(reset_ts, active_deadline):
                         continue
                 elif trigger == "proactive":
                     # Once active crosses the safety threshold, leave it only
-                    # for another account still below that same threshold.
-                    if utilization >= settings.threshold:
+                    # for another account below all applicable thresholds.
+                    if not candidate_safe:
                         continue
-                safe_target = utilization < settings.threshold
                 if trigger in ("at-limit", "failover"):
                     # Escapes may use any positive-headroom target, but rank
                     # below-threshold targets first.
                     key = (
-                        0 if safe_target else 1,
+                        0 if candidate_safe else 1,
                         reset_ts if reset_ts is not None else float("inf"),
                         -h,
                     )
@@ -1106,7 +1243,7 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger == "proactive" and self._in_cooldown(state):
+            if trigger in ("proactive", "safe-burn") and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 

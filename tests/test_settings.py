@@ -31,6 +31,9 @@ def _args(**kwargs) -> argparse.Namespace:
         "cooldown": None,
         "include_api_key_accounts": None,
         "strategy": None,
+        "model": None,
+        "drain_window": None,
+        "drain_threshold": None,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -63,6 +66,8 @@ class TestLoadSettings:
                 "intervalSeconds": 1,
                 "hysteresisPct": -5,
                 "unhealthyTicks": 0,
+                "drainWindowHours": 500,
+                "drainThreshold": 20,
             }
         }))
         loaded = load_settings(tmp_path)
@@ -70,6 +75,8 @@ class TestLoadSettings:
         assert loaded.interval_seconds == 15.0  # usage-cache TTL floor
         assert loaded.hysteresis_pct == 0.0
         assert loaded.unhealthy_ticks == 1
+        assert loaded.drain_window_hours == 168.0
+        assert loaded.drain_threshold == 50.0
 
     def test_bad_types_fall_back_to_defaults(self, tmp_path: Path):
         settings_path(tmp_path).write_text(json.dumps({
@@ -90,6 +97,10 @@ class TestLoadSettings:
             json.dumps({"autoswitch": {"strategy": "safe-burn"}})
         )
         assert load_settings(tmp_path).strategy == "safe-burn"
+
+    def test_models_parses_csv_names(self):
+        settings = AutoSwitchSettings(model=" Fable, Opus ,,Sonnet ")
+        assert settings.models == ("Fable", "Opus", "Sonnet")
 
 
 class TestSaveSettings:
@@ -161,6 +172,13 @@ class TestSetUnsetSetting:
         raw = json.loads(settings_path(tmp_path).read_text())
         assert raw["autoswitch"]["model"] == "Fable"
         assert load_settings(tmp_path).model == "Fable"
+
+    def test_set_drain_settings_round_trip(self, tmp_path: Path):
+        assert set_setting(tmp_path, "autoswitch.drainWindowHours", "12") == 12.0
+        assert set_setting(tmp_path, "autoswitch.drainThreshold", "98") == 98.0
+        loaded = load_settings(tmp_path)
+        assert loaded.drain_window_hours == 12.0
+        assert loaded.drain_threshold == 98.0
 
     def test_set_string_kind_rejects_empty(self, tmp_path: Path):
         with pytest.raises(ConfigError, match="unset"):
@@ -247,3 +265,11 @@ class TestMergedWithCli:
             AutoSwitchSettings(), _args(strategy="safe-burn")
         )
         assert merged.strategy == "safe-burn"
+
+    def test_drain_overrides(self):
+        merged = merged_with_cli(
+            AutoSwitchSettings(),
+            _args(drain_window=12.0, drain_threshold=97.0),
+        )
+        assert merged.drain_window_hours == 12.0
+        assert merged.drain_threshold == 97.0

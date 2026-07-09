@@ -335,6 +335,28 @@ def build_usage_result(data: dict) -> dict | None:
     return result if result else None
 
 
+def model_usage_windows(usage: dict | None, models: Sequence[str]) -> list[dict]:
+    """Scoped weekly usage windows matching model display names.
+
+    Matching is case-insensitive because the setting is user-authored while
+    display names come from the usage API. Malformed/absent scoped data simply
+    yields no matches, preserving compatibility with older API responses.
+    """
+    if not isinstance(usage, dict) or not models:
+        return []
+    scoped = usage.get("scoped")
+    if not isinstance(scoped, list):
+        return []
+    wanted = {model.lower() for model in models}
+    return [
+        window
+        for window in scoped
+        if isinstance(window, dict)
+        and isinstance(window.get("name"), str)
+        and window["name"].lower() in wanted
+    ]
+
+
 def account_headroom(
     usage: dict | None, models: Sequence[str] = ()
 ) -> float | None:
@@ -358,18 +380,11 @@ def account_headroom(
         for window in (usage.get("five_hour"), usage.get("seven_day"))
         if isinstance(window, dict) and isinstance(window.get("pct"), (int, float))
     ]
-    if models:
-        wanted = {m.lower() for m in models}
-        scoped = usage.get("scoped")
-        if isinstance(scoped, list):
-            pcts += [
-                s["pct"]
-                for s in scoped
-                if isinstance(s, dict)
-                and isinstance(s.get("pct"), (int, float))
-                and isinstance(s.get("name"), str)
-                and s["name"].lower() in wanted
-            ]
+    pcts += [
+        window["pct"]
+        for window in model_usage_windows(usage, models)
+        if isinstance(window.get("pct"), (int, float))
+    ]
     if not pcts:
         return None
     return 100.0 - max(pcts)
