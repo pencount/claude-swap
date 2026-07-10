@@ -207,9 +207,60 @@ def read_session_credentials(session_dir: Path) -> str | None:
         except KeychainError:
             pass  # locked/denied/timeout — the plaintext seed is the next-best truth
     try:
-        return (session_dir / ".credentials.json").read_text()
-    except OSError:
+        return (session_dir / ".credentials.json").read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        # ValueError covers UnicodeDecodeError: a byte-corrupt file is "no
+        # readable credential material", not an error to propagate.
         return None
+
+
+def read_session_identity(session_dir: Path) -> tuple[str, str] | None:
+    """Best-effort read of the account identity a session profile is logged in as.
+
+    Claude records the logged-in account in the profile's ``.claude.json``
+    ``oauthAccount`` and rewrites it on every (re-)login, so this reflects the
+    profile's *current* identity — which an in-session ``/login`` can re-point
+    at a different account than the slot the profile was created for. Returns
+    ``(email, organization_uuid)`` with ``""`` for a missing org, or ``None``
+    when no identity is readable (missing dir/file/field).
+    """
+    try:
+        text = (session_dir / ".claude.json").read_text(encoding="utf-8")
+        config = json.loads(text)
+    except (OSError, ValueError):
+        # ValueError covers JSONDecodeError and UnicodeDecodeError alike: a
+        # byte-corrupt file is an unreadable identity, and the usage-fetch
+        # path this feeds must never raise.
+        return None
+    if not isinstance(config, dict):
+        return None
+    oauth_account = config.get("oauthAccount") or {}
+    if not isinstance(oauth_account, dict):
+        return None
+    email = oauth_account.get("emailAddress") or ""
+    if not email:
+        return None
+    return email, oauth_account.get("organizationUuid") or ""
+
+
+def session_identity_drifted(session_dir: Path, email: str, org_uuid: str) -> bool:
+    """Whether the profile is logged in as a *different* account than its slot.
+
+    An in-session ``/login`` (e.g. after the slot's account hit its rate limit
+    mid-session) re-points the profile's credential at another account while
+    the profile directory keeps claiming the original slot. Comparison mirrors
+    ``_is_session_valid``: the email must match, the org only when both sides
+    have a value. An unreadable identity is NOT drift — missing metadata
+    degrades to trusting the profile (its token family is normally the slot's
+    freshest) rather than abandoning it over a broken ``.claude.json``.
+    """
+    identity = read_session_identity(session_dir)
+    if identity is None:
+        return False
+    profile_email, profile_org = identity
+    if profile_email != email:
+        return True
+    return bool(profile_org and org_uuid and profile_org != org_uuid)
 
 
 def live_sessions_for(session_dir: Path) -> list[ClaudeSession]:

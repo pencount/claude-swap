@@ -15,6 +15,7 @@ from claude_swap.autoswitch import (
     NO_RESET_FALLBACK_S,
     AllExhaustedEvent,
     AutoSwitchEngine,
+    ConfigWarningEvent,
     ErrorEvent,
     NoSwitchEvent,
     PollEvent,
@@ -186,13 +187,14 @@ class TestDecisionTable:
             "no-active-account"
         ]
 
-    def test_hysteresis_bar_blocks_marginal_candidates(self, harness):
-        # threshold 90, hysteresis 10 → candidates must sit at <= 80% used.
-        # Failing the bar is NOT exhaustion: no all-exhausted event, no
+    def test_hysteresis_margin_blocks_marginal_candidates(self, harness):
+        # threshold 90, hysteresis 10 → a candidate must beat the active
+        # account's utilization by >= 10 points; 95→86 is only 9 better.
+        # Failing the margin is NOT exhaustion: no all-exhausted event, no
         # reset-sleep — the next tick must stay at normal cadence so the
         # at-limit escape isn't missed when the active account tops out.
         outcome = harness.tick_with_usage({
-            "1": _usage(95), "2": _usage(85), "3": _usage(88),
+            "1": _usage(95), "2": _usage(86), "3": _usage(88),
         })
         assert outcome is TickOutcome.BLOCKED
         assert harness.active_number() == 1
@@ -202,6 +204,54 @@ class TestDecisionTable:
         assert harness.engine._sleep_until_ts is None
         delay = harness.engine._next_delay(outcome)
         assert delay <= 1.1 * harness.settings.interval_seconds
+
+    def test_issue_115_strictly_better_candidate_switches(self, harness):
+        # Regression for #115: active bound by 5h (99%), candidate bound by
+        # 7d (89%). The old absolute bar (<= 80% used) vetoed the candidate;
+        # the relative gate takes it: 89 < 90 and 99 - 89 >= 10.
+        outcome = harness.tick_with_usage({
+            "1": {"five_hour": {"pct": 99.0}, "seven_day": {"pct": 24.0}},
+            "2": {"five_hour": {"pct": 3.0}, "seven_day": {"pct": 89.0}},
+            "3": {"five_hour": {"pct": 95.0}, "seven_day": {"pct": 10.0}},
+        })
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "proactive"
+        assert harness.active_number() == 2
+
+    def test_proactive_never_lands_at_or_over_threshold(self, temp_home):
+        # threshold 80, hysteresis 5: the candidate at 85% is five points
+        # better than the active 90%, but it already sits over the threshold
+        # and would re-trigger on the very next tick — blocked.
+        h = EngineHarness(temp_home, threshold=80.0, hysteresis_pct=5.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({"1": _usage(90), "2": _usage(85)})
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["no-qualifying-candidate"]
+
+    def test_stable_landing_does_not_switch_back(self, temp_home):
+        # Cooldown disabled so only the gate itself prevents flapping: after
+        # 99→89 the roles reverse, and the old account (99%) can never beat
+        # the new active (89%) — the move is one-way.
+        h = EngineHarness(temp_home, cooldown_seconds=0.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        usage = {
+            "1": {"five_hour": {"pct": 99.0}, "seven_day": {"pct": 24.0}},
+            "2": {"five_hour": {"pct": 3.0}, "seven_day": {"pct": 89.0}},
+        }
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(60)
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]
 
     def test_mixed_unknown_and_exhausted_is_not_all_exhausted(self, harness):
         # One candidate at its limit, the other unreadable this tick: usage
@@ -1058,6 +1108,43 @@ class TestEventsShape:
         poll = next(e for e in harness.events if isinstance(e, PollEvent))
         line = poll.human()
         assert "Account-1" in line and "42% used" in line
+        # Others show per-window pcts, not just the ambiguous binding pct.
+        assert "#2: 5h 10% · 7d 0%" in line
+        assert "#3: ?" in line
+
+    def test_poll_event_windows_match_the_decision_set(self, temp_home):
+        # Scoped windows appear only when configured: rendering an ignored
+        # Fable 100% next to a switch onto that account would read as a bug.
+        usage = {
+            "1": _usage(42),
+            "2": {
+                "five_hour": {"pct": 3.0},
+                "seven_day": {"pct": 89.0},
+                "scoped": [{"name": "Fable", "pct": 21.0}],
+            },
+        }
+
+        def build(**kw):
+            h = EngineHarness(temp_home, **kw)
+            h.seed(1, "a@example.com")
+            h.seed(2, "b@example.com")
+            h.make_live("a@example.com", 1)
+            return h
+
+        plain = build()
+        plain.tick_with_usage(usage)
+        poll = next(e for e in plain.events if isinstance(e, PollEvent))
+        assert "#2: 5h 3% · 7d 89%" in poll.human()
+        assert "Fable" not in poll.human()
+        assert poll.to_json()["windowsPct"]["2"] == {"5h": 3.0, "7d": 89.0}
+
+        modeled = build(model="Fable")
+        modeled.tick_with_usage(usage)
+        poll = next(e for e in modeled.events if isinstance(e, PollEvent))
+        assert "#2: 5h 3% · 7d 89% · Fable 21%" in poll.human()
+        assert poll.to_json()["windowsPct"]["2"] == {
+            "5h": 3.0, "7d": 89.0, "Fable": 21.0,
+        }
 
 
 class TestRunLoop:
@@ -1115,6 +1202,247 @@ class TestRunLoop:
     def test_sleep_cap(self, harness):
         harness.engine._sleep_until_ts = harness.clock() + 50 * 3600
         assert harness.engine._next_delay(TickOutcome.BLOCKED) == 6 * 3600
+
+
+class TestTokenIdentity:
+    """The token endpoint's free identity data: uuid backfill and the
+    identity-conflict detector (the zero-request check that catches a
+    poisoned slot the moment auto freshens it)."""
+
+    def test_uuid_backfill_from_token_account_on_freshen(self, harness):
+        data = harness.switcher._get_sequence_data()
+        data["accounts"]["2"]["uuid"] = ""
+        harness.switcher._write_json(harness.switcher.sequence_file, data)
+        # Slot 2 near expiry → freshen path runs.
+        harness.switcher._write_account_credentials(
+            "2", "b@example.com",
+            json.dumps({"claudeAiOauth": {
+                "accessToken": "sk-2", "refreshToken": "rt-2", "expiresAt": 0,
+            }}),
+        )
+        fresh = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2f", "refreshToken": "rt-2f",
+            "expiresAt": 99_999_999_999_000,
+        }})
+        with patch(
+            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(
+                fresh, None,
+                {"uuid": "uuid-2-real", "email": "b@example.com",
+                 "organizationUuid": ""},
+            ),
+        ):
+            status = harness.engine._freshen_target("2", "b@example.com")
+        assert status == "ok"
+        assert harness.switcher._get_sequence_data()["accounts"]["2"]["uuid"] == (
+            "uuid-2-real"
+        )
+
+    def test_conflicting_token_identity_returns_identity_conflict(self, harness):
+        """A slot whose credential authenticates as a different account is not
+        a viable target — but the rotated generation is still persisted (the
+        grant consumed its predecessor)."""
+        harness.switcher._write_account_credentials(
+            "2", "b@example.com",
+            json.dumps({"claudeAiOauth": {
+                "accessToken": "sk-2", "refreshToken": "rt-2", "expiresAt": 0,
+            }}),
+        )
+        fresh = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2f", "refreshToken": "rt-2f",
+            "expiresAt": 99_999_999_999_000,
+        }})
+        with patch(
+            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(
+                fresh, None,
+                {"uuid": "uuid-somebody-else", "email": "z@example.com",
+                 "organizationUuid": ""},
+            ),
+        ):
+            status = harness.engine._freshen_target("2", "b@example.com")
+        assert status == "identity-conflict"
+        # The consumed generation's successor was persisted regardless.
+        assert harness.switcher.read_account_credentials(
+            "2", "b@example.com"
+        ) == fresh
+
+    def test_identity_conflict_quarantines_instead_of_activating(self, harness):
+        """Tick path: the conflicted slot is quarantined (wrong-account switch
+        prevented); rotation falls through to the next candidate."""
+        harness.switcher._write_account_credentials(
+            "2", "b@example.com",
+            json.dumps({"claudeAiOauth": {
+                "accessToken": "sk-2", "refreshToken": "rt-2", "expiresAt": 0,
+            }}),
+        )
+        fresh = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2f", "refreshToken": "rt-2f",
+            "expiresAt": 99_999_999_999_000,
+        }})
+
+        def refresh(creds):
+            data = json.loads(creds)["claudeAiOauth"]
+            if data["refreshToken"] == "rt-2":
+                return oauth.RefreshOutcome(
+                    fresh, None,
+                    {"uuid": "uuid-somebody-else", "email": "z@example.com",
+                     "organizationUuid": ""},
+                )
+            return oauth.RefreshOutcome(creds, None)
+
+        with patch(
+            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
+            side_effect=refresh,
+        ):
+            outcome = harness.tick_with_usage({
+                "1": _usage(95), "2": _usage(10), "3": _usage(80),
+            })
+        # Account 2 had the most headroom but is conflicted → quarantined,
+        # and the switch landed elsewhere.
+        assert "account-quarantined" in harness.kinds()
+        q = harness.state().get("quarantine", {})
+        assert q.get("2", {}).get("reason") == "identity-conflict"
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
+
+    def test_dead_slot_quarantined_even_with_safety_copy_present(self, harness):
+        """No automatic promotion (fail-open rework of the issue #117 guard):
+        a dead slot is quarantined outright; safety copies are forensic
+        material, and recovery is the documented /login + cswap add."""
+        harness.switcher._store._write_unclaimed_credential(
+            json.dumps({"claudeAiOauth": {
+                "accessToken": "sk-2-successor",
+                "refreshToken": "rt-2-successor",
+                "expiresAt": 99_999_999_999_000,
+            }}),
+            {"resolvedIdentity": {
+                "uuid": "uuid-2", "email": "b@example.com",
+                "organizationUuid": "",
+            }},
+        )
+        harness.switcher._write_account_credentials(
+            "2", "b@example.com",
+            json.dumps({"claudeAiOauth": {
+                "accessToken": "sk-2-dead", "refreshToken": "rt-2-dead",
+                "expiresAt": 0,
+            }}),
+        )
+
+        def refresh(creds):
+            data = json.loads(creds)["claudeAiOauth"]
+            if data["refreshToken"] == "rt-2-dead":
+                return oauth.RefreshOutcome(None, "invalid_grant")
+            return oauth.RefreshOutcome(creds, None)
+
+        with patch(
+            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
+            side_effect=refresh,
+        ):
+            outcome = harness.tick_with_usage({
+                "1": _usage(95), "2": _usage(10), "3": _usage(80),
+            })
+        q = harness.state().get("quarantine", {})
+        assert q.get("2", {}).get("reason") == "invalid_grant"
+        # The safety copy was not consumed, and the switch landed elsewhere.
+        assert len(harness.switcher.list_unclaimed_credentials()) == 1
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
+
+    def test_same_uuid_different_org_is_identity_conflict(self, harness):
+        """Organization is part of account identity everywhere else in the
+        codebase: the same account uuid under a different org is a conflict
+        (org compared only when both sides record one)."""
+        data = harness.switcher._get_sequence_data()
+        data["accounts"]["2"]["organizationUuid"] = "org-2"
+        harness.switcher._write_json(harness.switcher.sequence_file, data)
+        harness.switcher._write_account_credentials(
+            "2", "b@example.com",
+            json.dumps({"claudeAiOauth": {
+                "accessToken": "sk-2", "refreshToken": "rt-2", "expiresAt": 0,
+            }}),
+        )
+        fresh = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2f", "refreshToken": "rt-2f",
+            "expiresAt": 99_999_999_999_000,
+        }})
+        with patch(
+            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(
+                fresh, None,
+                {"uuid": "uuid-2", "email": "b@example.com",
+                 "organizationUuid": "org-other"},
+            ),
+        ):
+            status = harness.engine._freshen_target("2", "b@example.com")
+        assert status == "identity-conflict"
+
+    def test_malformed_token_identity_never_breaks_freshen(self, harness):
+        """A schema change feeding a non-string uuid must be ignored, not
+        raise — by this point the refreshed credential is already persisted,
+        and a crash here would skip the persist bookkeeping and error the
+        tick."""
+        harness.switcher._write_account_credentials(
+            "2", "b@example.com",
+            json.dumps({"claudeAiOauth": {
+                "accessToken": "sk-2", "refreshToken": "rt-2", "expiresAt": 0,
+            }}),
+        )
+        fresh = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2f", "refreshToken": "rt-2f",
+            "expiresAt": 99_999_999_999_000,
+        }})
+        with patch(
+            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(
+                fresh, None, {"uuid": 12345, "email": ["weird"]},
+            ),
+        ):
+            status = harness.engine._freshen_target("2", "b@example.com")
+        assert status == "ok"
+        assert harness.switcher.read_account_credentials(
+            "2", "b@example.com"
+        ) == fresh
+
+    def test_blank_uuid_slot_with_org_conflict_quarantines_not_backfills(
+        self, harness,
+    ):
+        """Org conflict must be checked before the blank-uuid backfill: a
+        wrong-org credential is evidence the slot holds the wrong account,
+        and backfilling its uuid would stick a foreign identity onto the
+        slot (backfill never rewrites a non-empty uuid). Blank-uuid slots
+        with a recorded org are what accounts added by older versions look
+        like."""
+        data = harness.switcher._get_sequence_data()
+        data["accounts"]["2"]["uuid"] = ""
+        data["accounts"]["2"]["organizationUuid"] = "org-A"
+        harness.switcher._write_json(harness.switcher.sequence_file, data)
+        harness.switcher._write_account_credentials(
+            "2", "b@example.com",
+            json.dumps({"claudeAiOauth": {
+                "accessToken": "sk-2", "refreshToken": "rt-2", "expiresAt": 0,
+            }}),
+        )
+        fresh = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2f", "refreshToken": "rt-2f",
+            "expiresAt": 99_999_999_999_000,
+        }})
+        with patch(
+            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(
+                fresh, None,
+                {"uuid": "uuid-real", "email": "z@example.com",
+                 "organizationUuid": "org-B"},
+            ),
+        ):
+            status = harness.engine._freshen_target("2", "b@example.com")
+        assert status == "identity-conflict"
+        # The foreign uuid was NOT backfilled onto the slot.
+        assert harness.switcher._get_sequence_data()["accounts"]["2"]["uuid"] == ""
+        # The successor generation was still persisted (grant consumed it).
+        assert harness.switcher.read_account_credentials(
+            "2", "b@example.com"
+        ) == fresh
 
 
 def _model_usage(five_h: float, fable: float) -> dict:
@@ -1214,6 +1542,21 @@ class TestModelAwareSwitch:
             "1": usage(5, 20, 100),   # Opus maxed
             "2": usage(5, 20, 30),    # most headroom
             "3": usage(5, 20, 70),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_all_sentinel_binds_every_scoped_window(self, temp_home):
+        # "all" needs no names: each account's own scoped windows bind,
+        # whatever they're called.
+        h = self._seed(temp_home, model="all")
+        outcome = h.tick_with_usage({
+            "1": {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 0.0},
+                  "scoped": [{"name": "Sonnet", "pct": 100.0}]},
+            "2": {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 0.0},
+                  "scoped": [{"name": "Sonnet", "pct": 20.0}]},
+            "3": {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 0.0},
+                  "scoped": [{"name": "Opus", "pct": 60.0}]},
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
@@ -1572,3 +1915,131 @@ class TestReservedAccounts:
         result = h.switcher.switch_to("2", json_output=True)
         assert result["switched"] is True
         assert h.active_number() == 2
+
+
+class TestModelAwareRecovery:
+    def _seed(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_dual_exhausted_candidate_recovers_at_its_later_reset(self, temp_home):
+        # #2 is blocked on both its 5h (resets 12:00) and Fable (15:00): it's
+        # only usable again at the LATER one. #3 recovers later still (20:00),
+        # so the all-exhausted wake is #2's Fable reset — which the old
+        # earliest-of-any-window scan (12:00) would have jumped early for.
+        h = self._seed(temp_home, model="Fable")
+        fable_reset = "2026-07-05T15:00:00Z"
+        outcome = h.tick_with_usage({
+            "1": _model_usage(95, 10),
+            "2": {
+                "five_hour": {"pct": 100.0, "resets_at": "2026-07-05T12:00:00Z"},
+                "seven_day": {"pct": 0.0},
+                "scoped": [
+                    {"name": "Fable", "pct": 100.0, "resets_at": fable_reset},
+                ],
+            },
+            "3": {
+                "five_hour": {"pct": 100.0, "resets_at": "2026-07-05T20:00:00Z"},
+                "seven_day": {"pct": 0.0},
+            },
+        })
+        assert outcome is TickOutcome.BLOCKED
+        exhausted = next(e for e in h.events if isinstance(e, AllExhaustedEvent))
+        assert exhausted.earliest_reset_at == fable_reset
+
+    def test_unknown_recovery_falls_back_instead_of_oversleeping(self, temp_home):
+        # #2 is exhausted with NO reset timestamp — it could recover any
+        # moment. Sleeping toward #3's known 20:00 reset would suppress
+        # checks for hours, so the wake time must be unprovable (bounded
+        # blocked-cadence fallback instead of a reset sleep).
+        h = self._seed(temp_home, model="Fable")
+        outcome = h.tick_with_usage({
+            "1": _model_usage(95, 10),
+            "2": {
+                "five_hour": {"pct": 0.0},
+                "seven_day": {"pct": 0.0},
+                "scoped": [{"name": "Fable", "pct": 100.0}],  # no resets_at
+            },
+            "3": {
+                "five_hour": {"pct": 100.0, "resets_at": "2026-07-05T20:00:00Z"},
+                "seven_day": {"pct": 0.0},
+            },
+        })
+        assert outcome is TickOutcome.BLOCKED
+        exhausted = next(e for e in h.events if isinstance(e, AllExhaustedEvent))
+        assert exhausted.earliest_reset_at is None
+        assert h.engine._sleep_until_ts is None
+        assert h.engine._next_delay(outcome) == NO_RESET_FALLBACK_S
+
+    def test_scoped_only_exhaustion_drives_the_wake_time(self, temp_home):
+        # Candidates blocked ONLY by Fable: the wake must come from the scoped
+        # reset — the 5h/7d-only scan would find no ≥100% window at all.
+        h = self._seed(temp_home, model="Fable")
+        fable_reset = "2026-07-06T09:00:00Z"
+        blocked = {
+            "five_hour": {"pct": 3.0, "resets_at": "2026-07-05T12:00:00Z"},
+            "seven_day": {"pct": 0.0},
+            "scoped": [{"name": "Fable", "pct": 100.0, "resets_at": fable_reset}],
+        }
+        outcome = h.tick_with_usage({
+            "1": _model_usage(95, 10), "2": blocked, "3": blocked,
+        })
+        assert outcome is TickOutcome.BLOCKED
+        exhausted = next(e for e in h.events if isinstance(e, AllExhaustedEvent))
+        assert exhausted.earliest_reset_at == fable_reset
+
+    def test_scoped_binding_window_keeps_active_cadence_tight(self, temp_home):
+        # Fable at 88% is inside the escalation band: poll every tick, not at
+        # the relaxed far-from-threshold cadence a 5%-used 5h would suggest.
+        h = self._seed(temp_home, model="Fable")
+        entry = UsageEntry(
+            last_good=_model_usage(5, 88), fetched_at=h.clock.now, age_s=0.0
+        )
+        assert h.engine._active_poll_interval_s(entry) == h.settings.interval_seconds
+        relaxed = AutoSwitchEngine(
+            h.switcher, AutoSwitchSettings(), h.events.append, clock=h.clock
+        )
+        assert relaxed._active_poll_interval_s(entry) > h.settings.interval_seconds
+
+    def test_unmatched_model_name_warns_once(self, temp_home):
+        h = self._seed(temp_home, model="Fabel")  # deliberate typo
+        usage = {
+            "1": _model_usage(5, 10),
+            "2": _model_usage(5, 10),
+            "3": _model_usage(5, 10),
+        }
+        h.tick_with_usage(usage)
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1
+        assert "Fabel" in warnings[0].message
+        assert warnings[0].to_json()["event"] == "config-warning"
+        h.tick_with_usage(usage)
+        warnings = [e for e in h.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1  # once per run, not per tick
+
+    def test_no_false_warning_while_an_account_is_unreadable(self, temp_home):
+        h = self._seed(temp_home, model="Fabel")
+        h.tick_with_usage({
+            "1": _model_usage(5, 10), "2": _model_usage(5, 10), "3": None,
+        })
+        assert not any(isinstance(e, ConfigWarningEvent) for e in h.events)
+        # Once every account reports, the check completes and warns.
+        h.tick_with_usage({
+            "1": _model_usage(5, 10),
+            "2": _model_usage(5, 10),
+            "3": _model_usage(5, 10),
+        })
+        assert any(isinstance(e, ConfigWarningEvent) for e in h.events)
+
+    def test_matching_name_never_warns(self, temp_home):
+        h = self._seed(temp_home, model="Fable")
+        h.tick_with_usage({
+            "1": _model_usage(5, 10),
+            "2": _model_usage(5, 10),
+            "3": _model_usage(5, 10),
+        })
+        assert not any(isinstance(e, ConfigWarningEvent) for e in h.events)
