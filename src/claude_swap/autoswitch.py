@@ -559,6 +559,58 @@ def _quota_threshold_state(
     )
 
 
+def _candidate_rank(
+    usage: dict | str | None,
+    headroom: float | None,
+    settings: AutoSwitchSettings,
+    models: Sequence[str],
+    now: float,
+    *,
+    trigger: str,
+    active_headroom: float | None,
+    active_deadline: float | None,
+) -> tuple | None:
+    """Return a candidate's strategy sort key, or ``None`` when ineligible."""
+    if headroom is None or headroom <= 0:
+        return None
+    utilization = 100.0 - headroom
+    if settings.strategy == "safe-burn":
+        reset_ts = _deadline_reset_ts(usage, models)
+        gate = _quota_threshold_state(
+            usage,
+            settings,
+            models,
+            now,
+            allow_model_drain=True,
+        )
+        candidate_safe = (
+            gate.below if gate is not None else utilization < settings.threshold
+        )
+        if trigger == "safe-burn":
+            if not candidate_safe or not _deadline_is_sooner(
+                reset_ts, active_deadline
+            ):
+                return None
+        elif trigger == "proactive" and not candidate_safe:
+            return None
+        if trigger in ("at-limit", "failover"):
+            return (
+                0 if candidate_safe else 1,
+                reset_ts if reset_ts is not None else float("inf"),
+                -headroom,
+            )
+        return (
+            reset_ts if reset_ts is not None else float("inf"),
+            -headroom,
+        )
+    if trigger == "proactive" and active_headroom is not None:
+        if utilization >= settings.threshold:
+            return None
+        if headroom - active_headroom < settings.hysteresis_pct:
+            return None
+    return (-headroom,)
+
+
 def _ref(number: str, email: str) -> dict:
     return {"number": int(number), "email": email}
 
@@ -1037,68 +1089,18 @@ class AutoSwitchEngine:
             if h is None:
                 continue
             any_known = True
-            if h <= 0:
-                continue  # itself at its limit — never a target
-            utilization = 100.0 - h
-            if safe_burn:
-                reset_ts = _deadline_reset_ts(usage.get(num), self._models)
-                candidate_gate = _quota_threshold_state(
-                    usage.get(num),
-                    settings,
-                    self._models,
-                    now,
-                    allow_model_drain=True,
-                )
-                candidate_safe = (
-                    candidate_gate.below
-                    if candidate_gate is not None
-                    else utilization < settings.threshold
-                )
-                if trigger == "safe-burn":
-                    # Below-threshold burn-down only moves to a strictly
-                    # earlier weekly/model reset, and only while the target
-                    # still has its applicable safety reserve. A configured
-                    # model may be in its deadline-aware drain ramp, while
-                    # normal 5h/7d windows always retain the base threshold.
-                    if not candidate_safe:
-                        continue
-                    if not _deadline_is_sooner(reset_ts, active_deadline):
-                        continue
-                elif trigger == "proactive":
-                    # Once active crosses the safety threshold, leave it only
-                    # for another account below all applicable thresholds.
-                    if not candidate_safe:
-                        continue
-                if trigger in ("at-limit", "failover"):
-                    # Escapes may use any positive-headroom target, but rank
-                    # below-threshold targets first.
-                    key = (
-                        0 if candidate_safe else 1,
-                        reset_ts if reset_ts is not None else float("inf"),
-                        -h,
-                    )
-                else:
-                    key = (
-                        reset_ts if reset_ts is not None else float("inf"),
-                        -h,
-                    )
+            key = _candidate_rank(
+                usage.get(num),
+                h,
+                settings,
+                self._models,
+                now,
+                trigger=trigger,
+                active_headroom=active_headroom,
+                active_deadline=active_deadline,
+            )
+            if key is not None:
                 qualifying.append((key, num))
-                continue
-            if trigger == "proactive" and active_headroom is not None:
-                # Hysteresis guards only the proactive case: two accounts
-                # hovering at the line must not ping-pong. The gate is
-                # relative — the candidate must beat the active account by
-                # the full margin (a one-way move like 99%→89% qualifies;
-                # near-line pairs can't flap back) — and the landing must be
-                # healthy: an account at/over the threshold would re-trigger
-                # on the very next tick. At-limit and failover are escapes —
-                # any account with real headroom beats a blocked or dead one
-                # (and you can't flap back onto an account at 100%).
-                if (100.0 - h) >= settings.threshold:
-                    continue
-                if h - active_headroom < settings.hysteresis_pct:
-                    continue  # not provably better than where we are
-            qualifying.append(((-h,), num))
         # Ascending by each strategy's key; list order (sequence order) breaks ties.
         qualifying.sort(key=lambda t: t[0])
         ordered = [num for _, num in qualifying]
@@ -1162,8 +1164,44 @@ class AutoSwitchEngine:
 
         # -- freshen + switch ----------------------------------------------
         transient_failure = False
+        usage_changed = False
         for num in ordered:
             email = self.switcher.account_email(num)
+            if num in oauth_candidates:
+                # Candidate ordering may use deliberately stale measurements.
+                # Recheck only the selected target before committing a switch;
+                # this keeps request volume bounded while preventing a landing
+                # on an account whose quota changed in another session.
+                checked = self.switcher.usage_entries_by_account(fetch={num}).get(num)
+                checked_usage = checked.decision_value() if checked else None
+                checked_headroom = oauth.account_headroom(
+                    checked_usage if isinstance(checked_usage, dict) else None,
+                    self._models,
+                )
+                if trigger == "safe-burn" and (
+                    checked is None
+                    or checked.last_error is not None
+                    or not checked.fresh(self.clock())
+                ):
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="target-usage-stale",
+                            detail=f"account {num} could not be revalidated",
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
+                if _candidate_rank(
+                    checked_usage,
+                    checked_headroom,
+                    settings,
+                    self._models,
+                    self.clock(),
+                    trigger=trigger,
+                    active_headroom=active_headroom,
+                    active_deadline=active_deadline,
+                ) is None:
+                    usage_changed = True
+                    continue
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
@@ -1194,6 +1232,14 @@ class AutoSwitchEngine:
                 )
             )
             return TickOutcome.ERROR
+        if usage_changed and trigger == "safe-burn":
+            self._emit(
+                NoSwitchEvent(
+                    reason="candidate-usage-changed",
+                    detail="revalidated target is no longer safe to use",
+                )
+            )
+            return TickOutcome.NO_ACTION
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
 
@@ -1204,16 +1250,14 @@ class AutoSwitchEngine:
     ) -> tuple[dict, dict[str, dict | str | None], dict[str, float | None]]:
         """Two-phase usage collection with an O(1) baseline.
 
-        Phase A fetches the active account (at its distance-to-threshold
+        Each pass fetches the active account (at its distance-to-threshold
         cadence — every tick only near the band, see
         :meth:`_active_poll_interval_s`) plus ONE due candidate (the one
         with the stalest data — never-fetched first, then oldest fetch);
-        everyone else is served from the usage store. Phase B refetches ALL
-        candidates and recomputes before any switch decision when a switch
-        could be near: active utilization within ``ESCALATION_MARGIN_PCT`` of
-        the threshold, or active usage unknown (failover must not run on
-        stale candidate data). Candidate selection never runs on the
-        pre-escalation snapshot.
+        everyone else is served from the usage store. The default ``best``
+        strategy retains its full refresh near the threshold. ``safe-burn``
+        stays bounded even near the threshold and revalidates only its chosen
+        target immediately before switching.
 
         Stalest-first needs no rotation cursor: it reads the persisted store,
         so the loop and cron-driven ``--once`` runs schedule identically.
@@ -1254,13 +1298,8 @@ class AutoSwitchEngine:
             active_value if isinstance(active_value, dict) else None, self._models
         )
         safe_burn = self.settings.strategy == "safe-burn"
-        escalate = bool(candidates) and (
-            (
-                safe_burn
-                and active_headroom is not None
-                and active_value != USAGE_TOKEN_EXPIRED
-            )
-            or (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
+        escalate = bool(candidates) and not safe_burn and (
+            (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
             or (
                 active_headroom is not None
                 and 100.0 - active_headroom

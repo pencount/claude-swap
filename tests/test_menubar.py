@@ -45,7 +45,7 @@ def test_settings_defaults_when_file_missing(tmp_path: Path):
     s = menubar.MenuBarSettings.load(tmp_path / "nope.json")
     assert s.show_account_name is True
     assert s.title_pct == "both"
-    assert s.refresh_interval == 60
+    assert s.refresh_interval == 30
     assert s.auto_switch_enabled is False
 
 
@@ -79,7 +79,7 @@ def test_settings_ignores_unknown_and_bad_types(tmp_path: Path):
     )
     s = menubar.MenuBarSettings.load(path)
     # bad-typed refresh_interval falls back to default; valid bool is kept
-    assert s.refresh_interval == 60
+    assert s.refresh_interval == 30
     assert s.show_account_name is False
 
 
@@ -322,6 +322,24 @@ def test_format_title_both_keeps_available_window():
     assert menubar.format_title("loc@x.com", {"five_hour": {"pct": 9.0}}, s) == "⇄ 9%"
 
 
+def test_format_title_marks_stale_active_usage():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="5h")
+    assert menubar.format_title(
+        "loc@x.com", _USAGE, s, active_age_s=125
+    ) == "⇄ 42% · ~2m"
+
+
+def test_format_title_marks_active_fetch_error():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="5h")
+    assert menubar.format_title(
+        "loc@x.com",
+        _USAGE,
+        s,
+        active_age_s=65,
+        active_error="http-429",
+    ) == "⇄ 42% · !1m"
+
+
 # --- reset-time helpers --------------------------------------------------------
 
 def test_resets_at_ts_orders_and_handles_missing():
@@ -414,10 +432,11 @@ def test_parse_switch_history_empty_or_no_matches():
 # --- snapshot adapter (fakes for AccountsSnapshot / UsageEntry) -----------------
 
 class _FakeEntry:
-    def __init__(self, sentinel=None, last_good=None, age_s=None):
+    def __init__(self, sentinel=None, last_good=None, age_s=None, last_error=None):
         self.sentinel = sentinel
         self.last_good = last_good
         self.age_s = age_s
+        self.last_error = last_error
 
 
 class _FakeAcct:
@@ -447,12 +466,19 @@ def test_adapt_snapshot_shape_and_active_selection():
     # pacing now lives in SnapshotSource, tested separately).
     lg = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 20.0}}
     accts = [
-        _FakeAcct("1", "a@x.com", True, _FakeEntry(last_good=lg, age_s=120)),
+        _FakeAcct(
+            "1",
+            "a@x.com",
+            True,
+            _FakeEntry(last_good=lg, age_s=120, last_error="http-429"),
+        ),
         _FakeAcct("2", "b@x.com", False, _FakeEntry(sentinel=USAGE_API_KEY)),
     ]
     snap = menubar._adapt_snapshot(_FakeSnap(accts))
     assert snap["active_email"] == "a@x.com"
     assert snap["active_usage"] == lg
+    assert snap["active_age_s"] == 120
+    assert snap["active_error"] == "http-429"
     # (num, email, is_active, display_usage, last_good, age_s)
     assert snap["accounts"][0] == ("1", "a@x.com", True, lg, lg, 120)
     # sentinel account: display is the human note, last_good is None

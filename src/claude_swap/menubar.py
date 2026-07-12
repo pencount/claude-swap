@@ -16,6 +16,7 @@ unit-tested in CI; ``rumps`` is imported lazily inside the app glue.
 from __future__ import annotations
 
 import json
+import logging
 import plistlib
 import re
 import sys
@@ -25,11 +26,12 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_swap import oauth
+from claude_swap import oauth, usage_store
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.settings import is_reserved_account
 from claude_swap.switcher import SENTINEL_NOTES
 from claude_swap.tui.data import format_age as format_usage_age
+from claude_swap.tui.data import format_duration
 
 ICON = "⇄"
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
@@ -88,7 +90,7 @@ class MenuBarSettings:
 
     show_account_name: bool = True
     title_pct: str = "both"  # one of TITLE_PCT_CHOICES
-    refresh_interval: int = 60
+    refresh_interval: int = 30
     auto_switch_enabled: bool = False
 
     @classmethod
@@ -289,6 +291,8 @@ def format_title(
     settings: MenuBarSettings,
     now: float | None = None,
     models: tuple[str, ...] = (),
+    active_age_s: float | None = None,
+    active_error: str | None = None,
 ) -> str:
     """Build the menu-bar title from the active account and settings."""
     if active_email is None:
@@ -314,6 +318,12 @@ def format_title(
             pct = window.get("pct")
             if isinstance(pct, (int, float)):
                 segments.append(f"{window['name']} {pct:.0f}%")
+    if active_error or (
+        active_age_s is not None and active_age_s >= usage_store.SERVE_TTL_S
+    ):
+        prefix = "!" if active_error else "~"
+        age = format_duration(active_age_s) if active_age_s is not None else ""
+        segments.append(f"{prefix}{age}")
     if not segments:
         return ICON
     return f"{ICON} " + " · ".join(segments)
@@ -409,7 +419,13 @@ def _account_display_usage(entry) -> dict | str | None:
     return entry.last_good
 
 
-EMPTY_SNAPSHOT: dict = {"accounts": [], "active_email": None, "active_usage": None}
+EMPTY_SNAPSHOT: dict = {
+    "accounts": [],
+    "active_email": None,
+    "active_usage": None,
+    "active_age_s": None,
+    "active_error": None,
+}
 
 
 def _adapt_snapshot(snap) -> dict:
@@ -424,6 +440,8 @@ def _adapt_snapshot(snap) -> dict:
     accounts = []
     active_email = None
     active_usage = None
+    active_age_s = None
+    active_error = None
     for acc in snap.accounts:
         display = _account_display_usage(acc.usage)
         accounts.append((
@@ -436,10 +454,14 @@ def _adapt_snapshot(snap) -> dict:
         ))
         if acc.is_active:
             active_email, active_usage = acc.email, display
+            active_age_s = getattr(acc.usage, "age_s", None)
+            active_error = getattr(acc.usage, "last_error", None)
     return {
         "accounts": accounts,
         "active_email": active_email,
         "active_usage": active_usage,
+        "active_age_s": active_age_s,
+        "active_error": active_error,
     }
 
 
@@ -661,6 +683,8 @@ def run(switcher) -> int:
                 self.snapshot["active_usage"],
                 self.settings,
                 models=models,
+                active_age_s=self.snapshot["active_age_s"],
+                active_error=self.snapshot["active_error"],
             )
             self.menu.clear()
             account_items = []

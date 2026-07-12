@@ -547,6 +547,32 @@ class TestAdaptiveScheduler:
         assert outcome is TickOutcome.NO_ACTION  # still below the threshold
         assert counts == {"1": 1, "2": 1, "3": 1}  # but everyone got refreshed
 
+    def test_safe_burn_near_threshold_stays_bounded(self, temp_home, monkeypatch):
+        h = self._harness(
+            temp_home,
+            monkeypatch,
+            strategy="safe-burn",
+            model="Fable",
+        )
+        counts: dict[str, int] = {}
+        usage = {
+            "1": _model_usage_with_reset(
+                5, 5, 95, fable_reset="2030-01-03T00:00:00Z"
+            ),
+            "2": _model_usage_with_reset(
+                5, 5, 10, fable_reset="2030-01-01T00:00:00Z"
+            ),
+            "3": _model_usage_with_reset(
+                5, 5, 20, fable_reset="2030-01-02T00:00:00Z"
+            ),
+        }
+
+        outcome = self._tick(h, counts, usage)
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert counts == {"1": 1, "2": 1}
+
     def test_active_unknown_escalates_before_failover(self, temp_home, monkeypatch):
         h = self._harness(temp_home, monkeypatch, unhealthy_ticks=1)
         counts: dict[str, int] = {}
@@ -1652,6 +1678,56 @@ class TestSafeBurnStrategy:
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
+
+    def test_revalidates_stale_target_before_switching(self, temp_home):
+        h = self._seed(temp_home)
+        now = h.clock.now
+        initial = {
+            "1": UsageEntry(
+                last_good=_model_usage_with_reset(
+                    5, 5, 20, fable_reset=self._LATER
+                ),
+                fetched_at=now,
+                age_s=0.0,
+            ),
+            "2": UsageEntry(
+                last_good=_model_usage_with_reset(
+                    5, 5, 30, fable_reset=self._SOON
+                ),
+                fetched_at=now - 120,
+                age_s=120.0,
+            ),
+            "3": UsageEntry(
+                last_good=_model_usage_with_reset(
+                    5, 5, 10, fable_reset=self._LATEST
+                ),
+                fetched_at=now - 60,
+                age_s=60.0,
+            ),
+        }
+        checked = {
+            **initial,
+            "2": UsageEntry(
+                last_good=_model_usage_with_reset(
+                    5, 5, 95, fable_reset=self._SOON
+                ),
+                fetched_at=now,
+                age_s=0.0,
+            ),
+        }
+
+        with patch.object(
+            h.switcher,
+            "usage_entries_by_account",
+            side_effect=[initial, initial, checked],
+        ) as usage_entries:
+            outcome = h.engine.tick()
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert usage_entries.call_args_list[-1].kwargs["fetch"] == {"2"}
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons[-1] == "candidate-usage-changed"
 
 
 class TestDeadlineDrain:
