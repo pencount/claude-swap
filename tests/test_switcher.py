@@ -914,10 +914,10 @@ class TestListAccountsUsage:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        # Store has a 100s-old entry for account "1" (past SERVE_TTL_S) and
+        # Store has a 400s-old entry for account "1" (past SERVE_TTL_S) and
         # nothing for "2" — both must be fetched live.
         backdated = UsageStore(
-            switcher.backup_dir / "cache", clock=lambda: time_mod.time() - 100
+            switcher.backup_dir / "cache", clock=lambda: time_mod.time() - 400
         )
         backdated.record(
             {"1": FetchRecord(usage={"five_hour": {"pct": 25}})},
@@ -942,6 +942,148 @@ class TestListAccountsUsage:
         # Should show live data (10%), not the stale 25%
         assert "10%" in output
         assert "25%" not in output
+
+    def test_on_demand_pass_persists_poll_plans(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        """Every collector — not just auto — writes the adapted cadence, so
+        all surfaces inherit one plan."""
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        usage_result = {
+            "five_hour": {"pct": 10, "clock": "Jan 1 03:00", "countdown": "0m"},
+            "seven_day": {"pct": 50, "clock": "Jan 2 03:00", "countdown": "0m"},
+        }
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_active_cc_running", return_value=True), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(usage_result)):
+            switcher.list_accounts()
+        capsys.readouterr()
+
+        entries = switcher._usage_store.entries(
+            {"1": ("test@example.com", ""), "2": ("account2@example.com", "")}
+        )
+        for num in ("1", "2"):
+            assert entries[num].next_poll_at is not None
+            assert entries[num].poll_interval_s is not None
+
+    def test_on_demand_pass_respects_poll_plans(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        """A stale entry whose ``nextPollAt`` is in the future is served, not
+        refetched — on-demand callers cannot out-poll the planned cadence."""
+        import time as time_mod
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        ident1 = {"1": ("test@example.com", "")}
+        backdated = UsageStore(
+            switcher.backup_dir / "cache", clock=lambda: time_mod.time() - 400
+        )
+        backdated.record(
+            {"1": FetchRecord(usage={"five_hour": {"pct": 25}})}, ident1
+        )
+        switcher._usage_store.set_poll_plan(
+            {"1": (time_mod.time() + 600.0, 600.0)}, ident1
+        )
+
+        usage_result = {
+            "five_hour": {"pct": 10, "clock": "Jan 1 03:00", "countdown": "0m"},
+            "seven_day": {"pct": 50, "clock": "Jan 2 03:00", "countdown": "0m"},
+        }
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch.object(switcher, "_active_cc_running", return_value=True), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(usage_result)) as mock_fetch:
+            switcher.list_accounts()
+
+        # Only account "2" (no stored row, no plan) was fetch-eligible.
+        assert mock_fetch.call_count == 1
+        output = capsys.readouterr().out
+        assert "25%" in output  # account 1 served from the store
+
+    def test_replan_new_active_pulls_candidate_plan_to_floor(
+        self, temp_home: Path, mock_claude_config: Path
+    ):
+        """A plan learned while the account idled as a candidate (up to 600s)
+        must not gate it once it becomes active."""
+        import time as time_mod
+
+        from claude_swap import poll_policy
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        ident = {"1": ("a@x.com", "")}
+        store = switcher._usage_store
+        store.record({"1": FetchRecord(usage={"five_hour": {"pct": 10}})}, ident)
+        store.set_poll_plan({"1": (time_mod.time() + 600.0, 600.0)}, ident)
+
+        switcher._replan_new_active("1", "a@x.com", "")
+        entry = store.entries(ident)["1"]
+        assert entry.poll_interval_s == poll_policy.MIN_INTERVAL_S
+        assert entry.next_poll_at <= time_mod.time() + poll_policy.MIN_INTERVAL_S + 1
+
+        # An already-eager plan (urgent cadence) is never pushed later.
+        store.set_poll_plan({"1": (time_mod.time() + 60.0, 60.0)}, ident)
+        switcher._replan_new_active("1", "a@x.com", "")
+        entry = store.entries(ident)["1"]
+        assert entry.poll_interval_s == 60.0
+
+        # A never-measured account gets no plan — a plan without a
+        # measurement would block on-demand callers from the first fetch.
+        ident2 = {"2": ("b@x.com", "")}
+        switcher._replan_new_active("2", "b@x.com", "")
+        assert store.entries(ident2)["2"].next_poll_at is None
+
+        # An already-old measurement comes due immediately, not 180s from now.
+        old_store = UsageStore(
+            switcher.backup_dir / "cache", clock=lambda: time_mod.time() - 400
+        )
+        old_store.record(
+            {"2": FetchRecord(usage={"five_hour": {"pct": 10}})}, ident2
+        )
+        store.set_poll_plan({"2": (time_mod.time() + 600.0, 600.0)}, ident2)
+        switcher._replan_new_active("2", "b@x.com", "")
+        entry = store.entries(ident2)["2"]
+        assert entry.next_poll_at <= time_mod.time() + 1
+
+    def test_replan_new_active_failure_is_logged_not_raised(
+        self, temp_home: Path, mock_claude_config: Path, caplog
+    ):
+        """The switch this rides on has already committed — a cache failure
+        here must never surface as a switch failure."""
+        import logging
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        ident = {"1": ("a@x.com", "")}
+        switcher._usage_store.record(
+            {"1": FetchRecord(usage={"five_hour": {"pct": 10}})}, ident
+        )
+        with patch.object(
+            switcher._usage_store, "set_poll_plan", side_effect=OSError("disk full")
+        ), caplog.at_level(logging.WARNING, logger="claude-swap"):
+            switcher._replan_new_active("1", "a@x.com", "")
+        assert any(
+            "switch itself succeeded" in r.getMessage() for r in caplog.records
+        )
 
     def test_list_fetch_set_restricts_fetches(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
@@ -5569,3 +5711,96 @@ class TestStashStorageHardening:
         assert entry_id in entries
         raw = store._stash_entry_path(entry_id).read_text().strip()
         assert base64.b64decode(raw, validate=True).decode() == "bytes-1"
+
+
+class TestRemoveAccountPrunesMappings:
+    """Removing an account drops any directory mappings pointing at it."""
+
+    def test_remove_account_prunes_mappings(self, temp_home, monkeypatch):
+        from claude_swap.mappings import MappingStore
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        data["accounts"]["1"] = {
+            "email": "a@x.com",
+            "uuid": "u1",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        data["sequence"] = [1]
+        switcher._write_json(switcher.sequence_file, data)
+
+        store = MappingStore(switcher.backup_dir)
+        store.set(temp_home, "a@x.com", "")
+        assert store.get(temp_home) is not None
+
+        monkeypatch.setattr("builtins.input", lambda *a, **k: "y")
+        switcher.remove_account("1")
+
+        assert store.get(temp_home) is None
+
+    def _config_switcher(self, temp_home, email):
+        """Write a live claude config for ``email`` and return a switcher."""
+        config = {
+            "oauthAccount": {
+                "emailAddress": email,
+                "accountUuid": "uuid-" + email,
+                "organizationUuid": "",
+                "organizationName": "",
+            }
+        }
+        (temp_home / ".claude.json").write_text(json.dumps(config))
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        return switcher
+
+    def test_slot_overwrite_prunes_displaced_mappings(self, temp_home):
+        """Overwriting a slot with a different account drops the old one's mappings."""
+        from claude_swap.mappings import MappingStore
+
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+
+        switcher = self._config_switcher(temp_home, "a@x.com")
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_delete_account_credentials"):
+            switcher.add_account(slot=3)
+
+        store = MappingStore(switcher.backup_dir)
+        store.set(temp_home, "a@x.com", "")
+
+        switcher = self._config_switcher(temp_home, "b@x.com")
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_delete_account_credentials"), \
+             patch("builtins.input", return_value="y"):
+            switcher.add_account(slot=3)
+
+        assert store.get(temp_home) is None
+
+    def test_slot_migration_keeps_mappings(self, temp_home):
+        """Moving an account to another slot keeps its identity-keyed mappings."""
+        from claude_swap.mappings import MappingStore
+
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+
+        switcher = self._config_switcher(temp_home, "a@x.com")
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_delete_account_credentials"):
+            switcher.add_account()  # lands in slot 1
+
+        store = MappingStore(switcher.backup_dir)
+        store.set(temp_home, "a@x.com", "")
+
+        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_delete_account_credentials"):
+            switcher.add_account(slot=5)  # same identity, new slot
+
+        assert store.get(temp_home) is not None
+        assert switcher.slot_for_directory(str(temp_home)) == ("5", "a@x.com")

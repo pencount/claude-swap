@@ -26,11 +26,10 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_swap import oauth, usage_store
+from claude_swap import oauth
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.settings import is_reserved_account
 from claude_swap.switcher import SENTINEL_NOTES
-from claude_swap.tui.data import format_age as format_usage_age
 from claude_swap.tui.data import format_duration
 
 ICON = "⇄"
@@ -39,6 +38,10 @@ AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95, 98)
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "model", "both", "all")
 SWITCH_HISTORY_LIMIT = 10
 NOTIFICATION_BUNDLE_ID = "com.claude-swap.menubar"
+# Display age is deliberately more sensitive than the backend's 180-second
+# API-budget freshness floor. It communicates measurement age without forcing
+# another /usage request.
+DISPLAY_STALE_S = 60.0
 
 
 def ensure_notification_identity(
@@ -271,7 +274,13 @@ def format_account_label(
     label = f"{num}  {email}  {usage_summary(usage, now, models)}"
     if reserved:
         label += " · reserved"
-    age = format_usage_age(age_s) if isinstance(usage, dict) else None
+    age = (
+        f"· {format_duration(age_s)} ago"
+        if isinstance(usage, dict)
+        and age_s is not None
+        and age_s >= DISPLAY_STALE_S
+        else None
+    )
     if age:
         label += f" {age}"
     return label
@@ -319,7 +328,7 @@ def format_title(
             if isinstance(pct, (int, float)):
                 segments.append(f"{window['name']} {pct:.0f}%")
     if active_error or (
-        active_age_s is not None and active_age_s >= usage_store.SERVE_TTL_S
+        active_age_s is not None and active_age_s >= DISPLAY_STALE_S
     ):
         prefix = "!" if active_error else "~"
         age = format_duration(active_age_s) if active_age_s is not None else ""

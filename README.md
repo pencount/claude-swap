@@ -130,6 +130,25 @@ cswap run 2 --share-history     # share your chat history with this account too
 
 Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, etc.), but each account keeps its own chat history. Pass `--share-history` if you want your accounts to continue the same conversations — a session started under one account shows up in `--resume` under the others, and nothing already saved is lost. Not supported on Windows yet.
 
+<details>
+<summary>Map accounts to directories — auto-pick per repo</summary>
+
+Bind a directory to an account, and a bare `cswap run` there launches that account in session mode — e.g. work account in work repos, personal elsewhere:
+
+```bash
+cswap map 2 ~/work/client-app   # map a directory to account 2
+cswap map user@example.com      # map the current directory
+cswap map                       # list mappings
+cswap unmap ~/work/client-app   # remove one (defaults to current directory)
+
+cd ~/work/client-app/src
+cswap run                       # → account 2, session mode
+```
+
+Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap run` just launches plain `claude` with your default login. Mappings are per-machine (not part of `cswap export`) and are cleaned up when their account is removed.
+
+</details>
+
 ### Interactive dashboard (TUI)
 
 Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
@@ -177,6 +196,7 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 - Account credentials stored securely using platform-appropriate methods
 - Switches (manual and automatic) hold Claude Code's own credential locks while writing, so a swap never interleaves with a token refresh
 - Auto-switch freshens a target's token before activating it, and quarantines accounts whose refresh token has died (recover with `cswap add --slot N`)
+- Usage numbers refresh every few minutes — faster for an account being used or close to switching, slower for idle ones — keeping cswap comfortably inside Anthropic's rate limits however many dashboards you keep open on a machine. An age note like `· 6m ago` just means the next scheduled check hasn't come yet, not that something is stuck.
 
 ## Data locations
 

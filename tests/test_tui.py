@@ -158,6 +158,14 @@ class FakeSwitcher:
         self.calls.append(("add_token", token, email, slot, assume_yes))
         print(f"Added Account {slot or 9}")
 
+    def set_poll_policy_inputs(
+        self, threshold: float, models: tuple[str, ...]
+    ) -> None:
+        self._poll_inputs_override = (threshold, models)
+
+    def clear_poll_policy_inputs(self) -> None:
+        self._poll_inputs_override = None
+
 
 def make_app(fake: FakeSwitcher):
     from claude_swap.tui.app import CswapApp
@@ -208,9 +216,12 @@ class TestFormatting:
         assert tui_data.format_duration(3600 * 26) == "1d 2h"
 
     def test_format_age_fresh_is_silent(self):
+        # Ages inside the serve TTL are the polling cadence at work, not
+        # staleness worth flagging.
         assert tui_data.format_age(3.0) is None
+        assert tui_data.format_age(120) is None
         assert tui_data.format_age(None) is None
-        assert tui_data.format_age(120) == "· 2m ago"
+        assert tui_data.format_age(400) == "· 6m ago"
 
     def test_sentinel_labels_match_cswap_list(self):
         # The TUI must describe sentinel states with the exact wording `cswap
@@ -265,6 +276,28 @@ class TestFormatting:
         assert text is not None and text.startswith("resets ")
         assert tui_data.window_reset_text(None, "five_hour", time.time()) is None
 
+    def test_reset_clock(self):
+        # Same-day reset → bare HH:MM; a reset days out carries its date.
+        now = time.time()
+        entry = make_entry()  # 5h resets in 2h, 7d in 3d
+        clock5 = tui_data.reset_clock(entry.last_good["five_hour"], now)
+        assert clock5 is not None and clock5.count(":") == 1
+        clock7 = tui_data.reset_clock(entry.last_good["seven_day"], now)
+        import calendar
+
+        months = list(calendar.month_abbr)[1:]
+        assert clock7 is not None and any(m in clock7 for m in months)
+
+    def test_reset_clock_unknown_or_elapsed_is_none(self):
+        now = time.time()
+        assert tui_data.reset_clock(None, now) is None
+        assert tui_data.reset_clock({"pct": 5.0}, now) is None
+        assert tui_data.reset_clock({"resets_at": "garbage"}, now) is None
+        # elapsed reset: the row says "resets now" — no clock to show
+        elapsed = {"resets_at": _iso_in(-60)}
+        assert tui_data.reset_clock(elapsed, now) is None
+        assert tui_data.reset_text(elapsed, now) == "resets now"
+
 
 class TestSnapshotSource:
     def _source(self, tmp_path: Path, accounts=None):
@@ -275,44 +308,21 @@ class TestSnapshotSource:
         )
         return fake, tui_data.SnapshotSource(fake)
 
-    def test_first_pass_is_full(self, tmp_path):
+    def test_every_pass_is_store_governed(self, tmp_path):
+        # Pacing lives in the usage store (poll plans + freshness + atomic
+        # reservation), so every take is the same on-demand pass `cswap list`
+        # runs — including the user's explicit refresh, which cannot bypass
+        # the store's per-token cadence.
         fake, source = self._source(tmp_path)
         source.take()
-        assert fake.fetch_sets == [None]
-
-    def test_steady_state_fetches_active_only(self, tmp_path):
-        fake, source = self._source(tmp_path)
-        source.take()
-        source.take()  # inside the SERVE_TTL window: no alternate yet
-        assert fake.fetch_sets[1] == {"1"}
-
-    def test_alternate_joins_once_per_ttl(self, tmp_path):
-        fake, source = self._source(tmp_path)
-        source.take()
-        source._next_alt_mono = 0.0  # force the TTL window to elapse
-        source.take()
-        assert fake.fetch_sets[1] == {"1", "2"}
-        source.take()  # timer was reset: back to active-only
-        assert fake.fetch_sets[2] == {"1"}
-
-    def test_full_refresh_and_store_only(self, tmp_path):
-        fake, source = self._source(tmp_path)
         source.take()
         source.take(full=True)
-        assert fake.fetch_sets[1] is None
-        source.take(store_only=True)
-        assert fake.fetch_sets[2] == set()
+        assert fake.fetch_sets == [None, None, None]
 
-    def test_sentinel_accounts_never_nominated(self, tmp_path):
-        accounts = [
-            make_account(1, active=True),
-            make_account(2, entry=make_entry(sentinel=USAGE_API_KEY)),
-        ]
-        fake, source = self._source(tmp_path, accounts)
-        source.take()
-        source._next_alt_mono = 0.0
-        source.take()
-        assert fake.fetch_sets[1] == {"1"}
+    def test_store_only_never_fetches(self, tmp_path):
+        fake, source = self._source(tmp_path)
+        source.take(store_only=True)
+        assert fake.fetch_sets == [set()]
 
 
 class TestUsageRows:
@@ -322,7 +332,7 @@ class TestUsageRows:
         from claude_swap.tui.widgets import usage_rows
 
         entry = make_entry(pct5=47.0, pct7=None)  # annual plan: no 7d window
-        labels = [label for label, _pct, _sfx in usage_rows(entry.last_good, time.time())]
+        labels = [label for label, *_ in usage_rows(entry.last_good, time.time())]
         assert labels == ["5h"]
 
     def test_scoped_models_and_over_limit_marker(self):
@@ -330,10 +340,12 @@ class TestUsageRows:
 
         entry = make_entry(scoped=[("Fable", 100.0), ("Opus", 12.0)])
         rows = usage_rows(entry.last_good, time.time())
-        labels = [label for label, _pct, _sfx in rows]
+        labels = [label for label, *_ in rows]
         assert labels == ["5h", "7d", "Fable", "Opus"]
         fable = next(row for row in rows if row[0] == "Fable")
         assert "(!)" in fable[2]
+        # the marker stays terminal in the clock-extended variant too
+        assert fable[3].endswith("(!)") and " · " in fable[3]
 
     def test_spend_row_first_with_amounts(self):
         from claude_swap.tui.widgets import usage_rows
@@ -343,11 +355,66 @@ class TestUsageRows:
         assert rows[0][0] == "$$"
         assert "$12.50 / $50.00" in rows[0][2]
 
+    def test_suffix_full_extends_countdown_with_clock(self):
+        from claude_swap.tui.widgets import usage_rows
+
+        entry = make_entry(pct5=47.0)
+        row5 = usage_rows(entry.last_good, time.time())[0]
+        assert row5[2].startswith("resets ")
+        assert row5[3].startswith(row5[2] + " · ")
+
+    def test_spend_clock_sits_with_reset_not_after_amounts(self):
+        from claude_swap.tui.widgets import usage_rows
+
+        entry = make_entry(
+            spend={
+                "used": 12.5,
+                "limit": 50.0,
+                "pct": 25.0,
+                "currency": "USD",
+                "resets_at": _iso_in(7200),
+            }
+        )
+        spend = usage_rows(entry.last_good, time.time())[0]
+        assert spend[0] == "$$"
+        assert " · " in spend[3]
+        assert spend[3].index(" · ") < spend[3].index("$12.50")
+
     def test_no_data_no_rows(self):
         from claude_swap.tui.widgets import usage_rows
 
         assert usage_rows(None, time.time()) == []
         assert usage_rows({}, time.time()) == []
+
+    def test_card_shows_clock_only_where_it_fits(self):
+        # Per-row degradation: the wide card shows every clock, a mid width
+        # keeps 5h/7d clocks while the longer spend row falls back to its
+        # countdown, and a narrow card is exactly the old countdown-only look.
+        from claude_swap.tui.widgets import account_card_text
+
+        entry = make_entry(
+            spend={
+                "used": 12.5,
+                "limit": 50.0,
+                "pct": 25.0,
+                "currency": "USD",
+                "resets_at": _iso_in(7200),
+            }
+        )
+        acc = make_account(1, active=True, entry=entry)
+
+        wide = account_card_text(acc, 100).plain
+        assert wide.count(" · ") == 3
+
+        mid_lines = account_card_text(acc, 78).plain.splitlines()
+        spend_line = next(line for line in mid_lines if "$12.50" in line)
+        assert " · " not in spend_line
+        for line in mid_lines:
+            if "resets" in line and "$12.50" not in line:
+                assert " · " in line
+
+        narrow = account_card_text(acc, 40).plain
+        assert " · " not in narrow
 
 
 class TestRunAction:
@@ -772,6 +839,8 @@ class _FakeEngine:
         self.on_event = on_event
         self.dry_run = dry_run
         self.stopped = False
+        self.applied_thresholds: list[float] = []
+        self.wakes = 0
         self._stop = threading.Event()
         _FakeEngine.instances.append(self)
 
@@ -783,6 +852,13 @@ class _FakeEngine:
     def stop(self) -> None:
         self.stopped = True
         self._stop.set()
+
+    def apply_threshold(self, threshold: float) -> None:
+        self.settings = dataclasses.replace(self.settings, threshold=threshold)
+        self.applied_thresholds.append(threshold)
+
+    def wake(self) -> None:
+        self.wakes += 1
 
 
 @pytest.fixture
@@ -854,6 +930,96 @@ class TestAutoScreen:
             assert isinstance(app.screen, DashboardScreen)
             assert fake_engine.instances[0].stopped is True
             assert app._store_only is False
+
+    async def test_threshold_adjust_is_session_only(self, tmp_path, fake_engine):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            assert app.threshold_pct == 90.0  # mount syncs to the file value
+            await pilot.press("right")  # inert outside adjust mode
+            await pilot.pause()
+            assert screen._settings.threshold == 90.0
+            await pilot.press("t", "right", "right", "right")
+            await pilot.pause()
+            assert screen._settings.threshold == 93.0
+            assert app.threshold_pct == 93.0
+            engine = fake_engine.instances[0]
+            assert engine.applied_thresholds == [91.0, 92.0, 93.0]
+            from textual.widgets import Static
+
+            summary = screen.query_one("#auto-summary", Static)
+            assert "threshold 93% (session)" in summary.render().plain
+            await pilot.press("enter")
+            await pilot.pause()
+            assert engine.wakes == 1  # one forced tick on leaving the mode
+            # the override lives in memory only — nothing was persisted
+            assert not (tmp_path / "settings.json").exists()
+            # a dry↔live restart rebuilds the engine from the adjusted copy
+            await pilot.press("l")
+            await pilot.pause()
+            await pilot.press("y")
+            await settle(pilot)
+            assert fake_engine.instances[1].settings.threshold == 93.0
+            await pilot.press("escape")
+            await settle(pilot)
+            # leaving the screen reverts the tick and unpins poll planning
+            assert app.threshold_pct == 90.0
+            assert fake._poll_inputs_override is None
+
+    async def test_threshold_adjust_escape_exits_mode_not_screen(
+        self, tmp_path, fake_engine
+    ):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            from claude_swap.tui.autoview import AutoScreen
+
+            await pilot.press("t")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            assert isinstance(app.screen, AutoScreen)
+            # no net change → no forced tick
+            assert fake_engine.instances[0].wakes == 0
+            await pilot.press("escape")
+            await settle(pilot)
+            from claude_swap.tui.dashboard import DashboardScreen
+
+            assert isinstance(app.screen, DashboardScreen)
+
+    async def test_threshold_clamps_and_keeps_meaningful_decimals(
+        self, tmp_path, fake_engine
+    ):
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1, "autoswitch": {"threshold": 99.0},
+        }))
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            await pilot.press("t", "right", "right")
+            await pilot.pause()
+            assert screen._settings.threshold == 99.9  # spec's upper bound
+            from textual.widgets import Static
+
+            summary = screen.query_one("#auto-summary", Static)
+            # never a lying "100%"
+            assert "threshold 99.9% (session)" in summary.render().plain
+            screen.action_threshold_step(-60.0)
+            await pilot.pause()
+            assert screen._settings.threshold == 50.0  # spec's lower bound
 
     async def test_candidates_ranked_by_headroom(self, tmp_path, fake_engine):
         fake = FakeSwitcher(
