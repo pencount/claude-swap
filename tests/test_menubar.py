@@ -187,6 +187,11 @@ def test_format_account_label_marks_reserved_account():
     assert label.endswith("· reserved")
 
 
+def test_format_account_label_with_alias():
+    label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, alias="dev")
+    assert label == "2  dev  (loc@papaya.asia)  5h 42% · 7d 18% · $ 30%"
+
+
 # --- usage logging -------------------------------------------------------------
 
 def test_format_usage_log_full():
@@ -250,6 +255,11 @@ def test_format_title_name_and_5h():
     assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc · 42%"
 
 
+def test_format_title_prefers_alias_over_local_part():
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="off")
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s, alias="dev") == "⇄ dev"
+
+
 def test_format_title_name_only_when_pct_off():
     s = menubar.MenuBarSettings(show_account_name=True, title_pct="off")
     assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc"
@@ -298,6 +308,30 @@ def test_format_title_model_only():
 def test_format_title_icon_only_when_off():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
     assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄"
+
+
+def test_format_title_scoped_appends_model_limits():
+    # title_pct="off" + title_scoped gives a title tracking only the scoped model
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="off", title_scoped=True)
+    usage = {**_USAGE, "scoped": [{"name": "Fable", "pct": 55.0}]}
+    assert menubar.format_title("loc@papaya.asia", usage, s) == "⇄ loc · Fable 55%"
+
+
+def test_format_title_scoped_after_windows_multiple_models():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="both", title_scoped=True)
+    usage = {
+        **_USAGE,
+        "scoped": [{"name": "Fable", "pct": 55.0}, {"name": "Opus", "pct": 7.0}],
+    }
+    assert menubar.format_title("loc@papaya.asia", usage, s) == "⇄ 42% · 18% · Fable 55% · Opus 7%"
+
+
+def test_format_title_scoped_off_by_default():
+    # default settings ignore scoped windows entirely
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
+    usage = {**_USAGE, "scoped": [{"name": "Fable", "pct": 55.0}]}
+    assert not s.title_scoped
+    assert menubar.format_title("loc@papaya.asia", usage, s) == "⇄"
 
 
 def test_format_title_icon_only_when_no_active_account():
@@ -440,11 +474,12 @@ class _FakeEntry:
 
 
 class _FakeAcct:
-    def __init__(self, number, email, is_active, usage):
+    def __init__(self, number, email, is_active, usage, alias=""):
         self.number = number
         self.email = email
         self.is_active = is_active
         self.usage = usage
+        self.alias = alias
 
 
 class _FakeSnap:
@@ -479,11 +514,18 @@ def test_adapt_snapshot_shape_and_active_selection():
     assert snap["active_usage"] == lg
     assert snap["active_age_s"] == 120
     assert snap["active_error"] == "http-429"
-    # (num, email, is_active, display_usage, last_good, age_s)
-    assert snap["accounts"][0] == ("1", "a@x.com", True, lg, lg, 120)
+    assert snap["active_alias"] == ""
+    # (num, email, is_active, display_usage, last_good, age_s, alias)
+    assert snap["accounts"][0] == ("1", "a@x.com", True, lg, lg, 120, "")
     # sentinel account: display is the human note, last_good is None
     assert snap["accounts"][1] == (
-        "2", "b@x.com", False, menubar.SENTINEL_NOTES[USAGE_API_KEY], None, None,
+        "2",
+        "b@x.com",
+        False,
+        menubar.SENTINEL_NOTES[USAGE_API_KEY],
+        None,
+        None,
+        "",
     )
 
 

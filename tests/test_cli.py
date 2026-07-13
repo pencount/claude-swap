@@ -635,6 +635,15 @@ class TestRunCommand:
         )
         assert "run 2" in result.stdout
 
+    def test_main_help_mentions_alias(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "claude_swap", "--help"],
+            capture_output=True,
+            text=True,
+            env=_subprocess_env(),
+        )
+        assert "alias <num|email>" in result.stdout
+
     def test_session_error_exits_cleanly(self, capsys):
         class FailingSessionManager:
             def __init__(self, switcher):
@@ -1159,6 +1168,136 @@ class TestMapCommand:
         assert "root" in capsys.readouterr().err
 
 
+class TestAliasCommand:
+    """`cswap alias` — set/unset/list a short display alias for an account."""
+
+    def _seeded_switcher_env(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        data["accounts"]["2"] = {
+            "email": "work@co.com",
+            "uuid": "u2",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        data["sequence"] = [2]
+        switcher._write_json(switcher.sequence_file, data)
+        return switcher
+
+    def test_set_alias_by_number(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._alias_command(["2", "dev"])
+
+        data = ClaudeAccountSwitcher()._get_sequence_data()
+        assert data["accounts"]["2"]["alias"] == "dev"
+        assert "dev" in capsys.readouterr().out
+
+    def test_set_alias_by_email(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._alias_command(["work@co.com", "dev"])
+
+        data = ClaudeAccountSwitcher()._get_sequence_data()
+        assert data["accounts"]["2"]["alias"] == "dev"
+
+    def test_unset_alias(self, temp_home, capsys):
+        switcher = self._seeded_switcher_env(temp_home)
+        data = switcher._get_sequence_data()
+        data["accounts"]["2"]["alias"] = "dev"
+        switcher._write_json(switcher.sequence_file, data)
+
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._alias_command(["2", "--unset"])
+
+        data = ClaudeAccountSwitcher()._get_sequence_data()
+        assert "alias" not in data["accounts"]["2"]
+
+    def test_list_aliases(self, temp_home, capsys):
+        switcher = self._seeded_switcher_env(temp_home)
+        data = switcher._get_sequence_data()
+        data["accounts"]["2"]["alias"] = "dev"
+        switcher._write_json(switcher.sequence_file, data)
+
+        with patch("os.geteuid", return_value=1000, create=True):
+            cli._alias_command([])
+
+        out = capsys.readouterr().out
+        assert "dev" in out
+
+    def test_missing_name_errors(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit):
+                cli._alias_command(["2"])
+
+    def test_unset_without_account_errors(self, temp_home, capsys):
+        """`cswap alias --unset` with no target must error, not silently list."""
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit):
+                cli._alias_command(["--unset"])
+
+    def test_unset_with_name_errors(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit):
+                cli._alias_command(["2", "dev", "--unset"])
+
+    def test_invalid_alias_errors(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                cli._alias_command(["2", "123"])
+        assert exc.value.code == 1
+        assert "Error" in capsys.readouterr().err
+
+    def test_unknown_account_errors(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=1000, create=True):
+            with pytest.raises(SystemExit) as exc:
+                cli._alias_command(["999", "dev"])
+        assert exc.value.code == 1
+
+    def test_dispatched_from_main(self, temp_home):
+        with patch("claude_swap.cli._alias_command") as alias_fn, \
+             patch.object(sys, "argv", ["claude-swap", "alias", "2", "dev"]):
+            cli.main()
+        alias_fn.assert_called_once_with(["2", "dev"])
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="root guard is POSIX-only")
+    def test_alias_refuses_root(self, temp_home, capsys):
+        self._seeded_switcher_env(temp_home)
+        with patch("os.geteuid", return_value=0, create=True), \
+             patch.object(ClaudeAccountSwitcher, "_is_running_in_container", return_value=False):
+            with pytest.raises(SystemExit) as exc:
+                cli._alias_command(["2", "dev"])
+        assert exc.value.code == 1
+        assert "root" in capsys.readouterr().err
+
+    def test_add_with_alias_flag(self, temp_home, mock_claude_config, capsys):
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+        with patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(ClaudeAccountSwitcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(ClaudeAccountSwitcher, "_write_account_credentials"), \
+             patch.object(sys, "argv", ["claude-swap", "add", "--alias", "dev"]):
+            cli.main()
+
+        data = ClaudeAccountSwitcher()._get_sequence_data()
+        assert data["accounts"]["1"]["alias"] == "dev"
+
+    def test_alias_flag_without_add_errors(self, temp_home, capsys):
+        with patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "list", "--alias", "dev"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 2
+        assert "--alias can only be used with 'add'" in capsys.readouterr().err
+
+
 class TestRunAutoResolve:
     """`cswap run` with no account resolves the cwd's directory mapping."""
 
@@ -1333,3 +1472,38 @@ class TestRunAutoResolve:
              patch.object(sys, "argv", ["claude-swap", "run", "--share-history"]):
             cli.main()
         assert ("run", "2", [], True, True) in calls
+
+
+class TestDisableEnableDispatch:
+    """`cswap disable`/`cswap enable` (and the legacy --disable-account /
+    --enable-account flags) forward to switcher.set_account_disabled."""
+
+    def _run(self, argv):
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", *argv]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+        return switcher_cls.return_value
+
+    def test_disable_subcommand_forwards(self):
+        switcher = self._run(["disable", "2"])
+        switcher.set_account_disabled.assert_called_once_with("2", True)
+
+    def test_enable_subcommand_forwards(self):
+        switcher = self._run(["enable", "user@example.com"])
+        switcher.set_account_disabled.assert_called_once_with("user@example.com", False)
+
+    def test_legacy_disable_flag_forwards(self):
+        switcher = self._run(["--disable-account", "3"])
+        switcher.set_account_disabled.assert_called_once_with("3", True)
+
+    def test_legacy_enable_flag_forwards(self):
+        switcher = self._run(["--enable-account", "3"])
+        switcher.set_account_disabled.assert_called_once_with("3", False)
+
+    def test_disable_without_target_errors(self, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "disable"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2

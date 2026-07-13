@@ -93,6 +93,7 @@ class MenuBarSettings:
 
     show_account_name: bool = True
     title_pct: str = "both"  # one of TITLE_PCT_CHOICES
+    title_scoped: bool = False  # append all per-model weekly limits to the title
     refresh_interval: int = 30
     auto_switch_enabled: bool = False
 
@@ -269,9 +270,11 @@ def format_account_label(
     models: tuple[str, ...] = (),
     age_s: float | None = None,
     reserved: bool = False,
+    alias: str | None = None,
 ) -> str:
     """Build one account row's menu label."""
-    label = f"{num}  {email}  {usage_summary(usage, now, models)}"
+    identity = f"{alias}  ({email})" if alias else email
+    label = f"{num}  {identity}  {usage_summary(usage, now, models)}"
     if reserved:
         label += " · reserved"
     age = (
@@ -302,6 +305,7 @@ def format_title(
     models: tuple[str, ...] = (),
     active_age_s: float | None = None,
     active_error: str | None = None,
+    alias: str | None = None,
 ) -> str:
     """Build the menu-bar title from the active account and settings."""
     if active_email is None:
@@ -310,7 +314,7 @@ def format_title(
         now = time.time()
     segments: list[str] = []
     if settings.show_account_name:
-        segments.append(_local_part(active_email))
+        segments.append(alias if alias else _local_part(active_email))
     if settings.title_pct in ("5h", "both", "all"):
         p = _window_pct(active_usage, "five_hour")
         if p is not None:
@@ -322,11 +326,19 @@ def format_title(
         if p is not None:
             segments.append(f"{p:.0f}%")
     if settings.title_pct in ("model", "all"):
-        for window in oauth.model_usage_windows(active_usage, models):
-            window = _rolled_weekly_window(window, now)
-            pct = window.get("pct")
-            if isinstance(pct, (int, float)):
-                segments.append(f"{window['name']} {pct:.0f}%")
+        scoped = oauth.model_usage_windows(active_usage, models)
+    elif settings.title_scoped and isinstance(active_usage, dict):
+        scoped = active_usage.get("scoped") or []
+    else:
+        scoped = []
+    for window in scoped:
+        window = _rolled_weekly_window(window, now)
+        if (
+            isinstance(window, dict)
+            and isinstance(window.get("pct"), (int, float))
+            and window.get("name")
+        ):
+            segments.append(f"{window['name']} {window['pct']:.0f}%")
     if active_error or (
         active_age_s is not None and active_age_s >= DISPLAY_STALE_S
     ):
@@ -434,6 +446,7 @@ EMPTY_SNAPSHOT: dict = {
     "active_usage": None,
     "active_age_s": None,
     "active_error": None,
+    "active_alias": None,
 }
 
 
@@ -441,36 +454,43 @@ def _adapt_snapshot(snap) -> dict:
     """Adapt an ``AccountsSnapshot`` to the menu bar's render dict.
 
     Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good,
-    age_s), ...],
-    "active_email": str | None, "active_usage": dict | str | None}``. The snapshot
-    itself is produced by ``SnapshotSource`` (the paced read path), so this is a
-    pure transform — no fetching, no I/O.
+    age_s, alias), ...],
+    "active_email": str | None, "active_usage": dict | str | None,
+    "active_alias": str | None}``. The snapshot itself is produced by
+    ``SnapshotSource`` (the paced read path), so this is a pure transform — no
+    fetching, no I/O.
     """
     accounts = []
     active_email = None
     active_usage = None
     active_age_s = None
     active_error = None
+    active_alias = None
     for acc in snap.accounts:
         display = _account_display_usage(acc.usage)
-        accounts.append((
-            acc.number,
-            acc.email,
-            acc.is_active,
-            display,
-            acc.usage.last_good,
-            getattr(acc.usage, "age_s", None),
-        ))
+        accounts.append(
+            (
+                acc.number,
+                acc.email,
+                acc.is_active,
+                display,
+                acc.usage.last_good,
+                getattr(acc.usage, "age_s", None),
+                acc.alias,
+            )
+        )
         if acc.is_active:
             active_email, active_usage = acc.email, display
             active_age_s = getattr(acc.usage, "age_s", None)
             active_error = getattr(acc.usage, "last_error", None)
+            active_alias = acc.alias
     return {
         "accounts": accounts,
         "active_email": active_email,
         "active_usage": active_usage,
         "active_age_s": active_age_s,
         "active_error": active_error,
+        "active_alias": active_alias,
     }
 
 
@@ -557,7 +577,7 @@ def run(switcher) -> int:
             machine doesn't churn the rotating log with identical lines.
             """
             models = self._models()
-            for num, email, _is_active, _display, last_good, _age_s in snap["accounts"]:
+            for num, email, _is_active, _display, last_good, _age_s, _alias in snap["accounts"]:
                 key = _usage_log_key(last_good, models)
                 if key == (None, None) or self._last_usage_log.get(num) == key:
                     continue
@@ -694,20 +714,31 @@ def run(switcher) -> int:
                 models=models,
                 active_age_s=self.snapshot["active_age_s"],
                 active_error=self.snapshot["active_error"],
+                alias=self.snapshot.get("active_alias"),
             )
             self.menu.clear()
             account_items = []
-            for num, email, is_active, display, _last_good, age_s in self.snapshot["accounts"]:
+            for (
+                num,
+                email,
+                is_active,
+                display,
+                _last_good,
+                age_s,
+                alias,
+            ) in self.snapshot["accounts"]:
                 item = rumps.MenuItem(
                     format_account_label(
                         num,
                         email,
                         display,
+                        models=models,
                         age_s=age_s,
                         reserved=(
                             is_reserved_account(num, email, auto_settings)
                             if auto_settings else False
                         ),
+                        alias=alias,
                     ),
                     callback=self._make_switch_to(num),
                 )
@@ -745,8 +776,9 @@ def run(switcher) -> int:
             accounts = self.snapshot["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
-            for num, email, _is_active, _display, _last_good, _age_s in accounts:
-                menu.add(rumps.MenuItem(f"{num}  {email}", callback=self._make_remove(num)))
+            for num, email, _is_active, _display, _last_good, _age_s, alias in accounts:
+                label = f"{num}  {alias}  ({email})" if alias else f"{num}  {email}"
+                menu.add(rumps.MenuItem(label, callback=self._make_remove(num)))
             return menu
 
         def _history_menu(self, rumps):
@@ -785,6 +817,12 @@ def run(switcher) -> int:
                 ch.state = 1 if self.settings.title_pct == mode else 0
                 title_pct.add(ch)
             menu.add(title_pct)
+
+            scoped_item = rumps.MenuItem(
+                "Show model limits in title", callback=self.on_toggle_scoped
+            )
+            scoped_item.state = 1 if self.settings.title_scoped else 0
+            menu.add(scoped_item)
 
             interval = rumps.MenuItem("Refresh interval")
             labels = {30: "30 seconds", 60: "60 seconds", 300: "5 minutes"}
@@ -923,6 +961,10 @@ def run(switcher) -> int:
 
         def on_toggle_name(self, _sender):
             self.settings.show_account_name = not self.settings.show_account_name
+            self._save_and_rebuild()
+
+        def on_toggle_scoped(self, _sender):
+            self.settings.title_scoped = not self.settings.title_scoped
             self._save_and_rebuild()
 
         def _make_title_pct(self, mode):
