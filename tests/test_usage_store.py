@@ -209,10 +209,13 @@ class TestBackoff:
             clock.advance(want + 1)
 
     def test_retry_after_floor_is_capped(self):
-        # A pathological Retry-After can never park an account for hours.
+        # Honor a full one-hour recovery window, but reject pathological values.
         assert usage_store._failure_backoff_s(1, 5000.0) == pytest.approx(
             usage_store.RETRY_AFTER_FLOOR_CAP_S
         )
+
+    def test_one_hour_retry_after_is_honored(self):
+        assert usage_store._failure_backoff_s(1, 3591.0) == pytest.approx(3591.0)
 
     def test_measured_burst_block_honored_exactly(self):
         # The real burst rule (measured 2026-07-06) sends Retry-After: 300 and

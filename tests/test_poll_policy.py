@@ -43,9 +43,9 @@ class TestIntervalAdaptation:
         assert candidate == poll_policy.CANDIDATE_DEFAULT_INTERVAL_S
 
     def test_unmoved_decays_toward_the_ceiling(self):
-        _, interval = _plan(prev_interval_s=300.0, prev_usage=_usage(10))
-        assert interval == 450.0
-        _, capped = _plan(prev_interval_s=500.0, prev_usage=_usage(10))
+        _, interval = _plan(prev_interval_s=1800.0, prev_usage=_usage(10))
+        assert interval == 2700.0
+        _, capped = _plan(prev_interval_s=3000.0, prev_usage=_usage(10))
         assert capped == poll_policy.CANDIDATE_MAX_INTERVAL_S
         _, active_capped = _plan(
             prev_interval_s=250.0, prev_usage=_usage(10), is_active=True
@@ -128,7 +128,7 @@ class TestPost429Floor:
 
     def test_slower_learned_cadence_survives_the_floor(self):
         _, interval = _plan(
-            recent_429=True, prev_interval_s=590.0, prev_usage=_usage(10)
+            recent_429=True, prev_interval_s=3000.0, prev_usage=_usage(10)
         )
         assert interval == poll_policy.CANDIDATE_MAX_INTERVAL_S
 

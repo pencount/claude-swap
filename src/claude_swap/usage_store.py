@@ -68,9 +68,9 @@ BACKOFF_CAP_S = 600.0
 #   poll_policy.EDGE_BACKOFF_S before probing again.
 # - "Retry-After: N>0" = the burst rule (several rapid requests on one token
 #   → hard block; measured: accurate, counts down, not extended by probing).
-#   Honored as the wait, up to a safety cap so a pathological header can
-#   never park an account for hours.
-RETRY_AFTER_FLOOR_CAP_S = 900.0
+#   Honor the full measured recovery horizon. Values beyond one hour are still
+#   capped so a pathological header cannot park an account indefinitely.
+RETRY_AFTER_FLOOR_CAP_S = 3600.0
 
 # A dead refresh-token lineage (the token endpoint answered ``invalid_grant``,
 # e.g. "Refresh token not found or invalid") can never recover on its own —

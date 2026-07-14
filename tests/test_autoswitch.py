@@ -362,6 +362,25 @@ class TestDecisionTable:
         assert harness.tick_with_usage(unknown) is TickOutcome.NO_ACTION
         assert harness.active_number() == 1
 
+    def test_active_429_immediately_fails_over_from_stale_usage(self, harness):
+        now = harness.clock.now
+        outcome = harness.tick_with_entries({
+            "1": UsageEntry(
+                last_good=_usage(38),
+                fetched_at=now - 180,
+                age_s=180.0,
+                consecutive_failures=1,
+                last_error="http-429",
+                trust_extended=True,
+            ),
+            "2": UsageEntry(last_good=_usage(10), fetched_at=now, age_s=0.0),
+            "3": UsageEntry(last_good=_usage(20), fetched_at=now, age_s=0.0),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+        switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "failover"
+
     def test_all_candidates_unknown_is_no_comparison(self, harness):
         outcome = harness.tick_with_usage({
             "1": _usage(95), "2": None, "3": None,
@@ -750,11 +769,11 @@ class TestAdaptiveScheduler:
         assert counts["1"] == 3
         assert counts["2"] == 2  # now stale → the escalation refreshes it
 
-    def test_active_in_backoff_keeps_trusted_headroom(self, temp_home, monkeypatch):
-        # The active account's fetches are being refused (429 with a long
-        # Retry-After). Its last-good data ages past STALE_OK_S, but the
-        # staleness is deliberate: headroom stays known, so no unhealthy
-        # ticks and no escalate-all burst while the server is rate limiting.
+    def test_active_429_in_backoff_fails_over_immediately(
+        self, temp_home, monkeypatch
+    ):
+        # A long Retry-After makes active usage unobservable. The last-good
+        # value stays available for display but cannot suppress failover.
         h = self._harness(temp_home, monkeypatch)
         usage = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
         counts: dict[str, int] = {}
@@ -768,10 +787,13 @@ class TestAdaptiveScheduler:
         h.clock.advance(400)  # active data now well past STALE_OK_S, in backoff
         counts.clear()
         outcome = self._tick(h, counts, usage)
-        assert outcome is TickOutcome.NO_ACTION
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
         assert h.engine._unhealthy_ticks == 0
         assert "1" not in counts  # backoff respected
-        assert sum(counts.values()) == 1  # baseline slot only, no escalate-all
+        assert counts == {"2": 1, "3": 1}  # candidates verified before failover
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "failover"
 
     def test_exhausted_candidate_skips_to_its_reset(self, temp_home, monkeypatch):
         from datetime import datetime, timezone
@@ -826,19 +848,19 @@ class TestAdaptiveScheduler:
             )["2"].poll_interval_s
 
         self._tick(h, counts, usage)          # first data point → base interval
-        assert interval() == poll_policy.CANDIDATE_DEFAULT_INTERVAL_S  # 300s
+        assert interval() == poll_policy.CANDIDATE_DEFAULT_INTERVAL_S
         h.clock.advance(180)
-        self._tick(h, counts, usage)          # not due yet (300s interval)
+        self._tick(h, counts, usage)          # not due yet (1800s interval)
         assert counts["2"] == 1
-        h.clock.advance(120)
+        h.clock.advance(1620)
         self._tick(h, counts, usage)          # unmoved → backs off ×1.5
         assert counts["2"] == 2
-        assert interval() == 450.0
-        h.clock.advance(450)
+        assert interval() == 2700.0
+        h.clock.advance(2700)
         usage["2"] = _usage(20)               # moved 10 pts on another machine
         self._tick(h, counts, usage)
         assert counts["2"] == 3
-        assert interval() == 225.0            # halved: polled closer while moving
+        assert interval() == 1350.0           # halved: polled closer while moving
 
     def test_idle_hold_skips_candidate_polling(self, temp_home, monkeypatch):
         h = self._harness(temp_home, monkeypatch)

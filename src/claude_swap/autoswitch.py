@@ -20,7 +20,10 @@ the ordinary 5h/7d thresholds remain fixed. Candidates must sit
 ``hysteresis_pct`` below the threshold in the default strategy so two accounts
 hovering at the line never ping-pong, and a ``cooldown_seconds`` floor bounds
 the switch rate (bypassed only when the active account is hard at its limit).
-Before activation the target's token is *freshened* (refreshed if it expires
+An HTTP 429 on the active account's usage check fails closed immediately: its
+last-good percentage remains available for display, but cannot justify
+continuing a session while telemetry is blocked. Before activation the target's
+usage is revalidated and its token is *freshened* (refreshed if it expires
 within 10 minutes — twice Claude Code's refresh buffer, so a running Claude
 Code's under-lock re-read sees a fresh token and aborts its own refresh); a
 target whose refresh token is dead gets quarantined instead of activated. When
@@ -926,8 +929,20 @@ class AutoSwitchEngine:
             )
             return TickOutcome.NO_ACTION
 
+        active_entry = entries.get(current)
+        active_rate_limited = bool(
+            active_entry is not None
+            and active_entry.sentinel is None
+            and active_entry.last_error == "http-429"
+        )
         active_headroom = headroom.get(current)
-        if active_headroom is not None:
+        if active_rate_limited:
+            # A hard usage-endpoint block can outlive an entire high-burn
+            # session. Never let its last-good percentage suppress failover.
+            self._unhealthy_ticks = 0
+            self._idle_hold_since = None
+            trigger = "failover"
+        elif active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = (
@@ -1134,7 +1149,8 @@ class AutoSwitchEngine:
                     checked_usage if isinstance(checked_usage, dict) else None,
                     self._models,
                 )
-                if trigger == "safe-burn" and (
+                requires_fresh_usage = trigger in ("safe-burn", "failover")
+                if requires_fresh_usage and (
                     checked is None
                     or checked.last_error is not None
                     or not checked.fresh(self.clock())
@@ -1145,7 +1161,9 @@ class AutoSwitchEngine:
                             detail=f"account {num} could not be revalidated",
                         )
                     )
-                    return TickOutcome.NO_ACTION
+                    if trigger == "safe-burn":
+                        return TickOutcome.NO_ACTION
+                    continue
                 if _candidate_rank(
                     checked_usage,
                     checked_headroom,
@@ -1231,6 +1249,8 @@ class AutoSwitchEngine:
 
         Returns ``(entries, usage, headroom)`` where ``usage`` carries
         decision values and ``headroom`` the derived headroom per account.
+        An active HTTP 429 is projected as unknown even while its last-good
+        measurement remains store-trusted for display and non-active callers.
         """
         now = self.clock()
         # Quarantined accounts can never be switch targets, so spending the
@@ -1279,8 +1299,22 @@ class AutoSwitchEngine:
             pick = due_candidate(candidates, pre, now)
             if pick is not None:
                 plan.add(pick)
+
+        def decision_values(snapshot: dict) -> dict[str, dict | str | None]:
+            values = {
+                num: entry.decision_value() for num, entry in snapshot.items()
+            }
+            active = snapshot.get(current)
+            if (
+                active is not None
+                and active.sentinel is None
+                and active.last_error == "http-429"
+            ):
+                values[current] = None
+            return values
+
         entries = self.switcher.usage_entries_by_account(fetch=plan)
-        usage = {num: entry.decision_value() for num, entry in entries.items()}
+        usage = decision_values(entries)
 
         active_value = usage.get(current)
         active_headroom = oauth.account_headroom(
@@ -1301,7 +1335,7 @@ class AutoSwitchEngine:
             entries = self.switcher.usage_entries_by_account(
                 fetch={current, *candidates}
             )
-            usage = {num: entry.decision_value() for num, entry in entries.items()}
+            usage = decision_values(entries)
 
         headroom = {
             num: oauth.account_headroom(

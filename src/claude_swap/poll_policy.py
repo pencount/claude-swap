@@ -57,10 +57,11 @@ MIN_INTERVAL_S = 180.0
 URGENT_INTERVAL_S = 60.0
 
 # Decay ceilings for an account whose usage is not moving: the active account
-# stays reasonably fresh, an idle alternate drifts out to ten minutes.
+# stays reasonably fresh, while idle alternates preserve their per-token status
+# budget for when they are selected or explicitly revalidated before a switch.
 ACTIVE_MAX_INTERVAL_S = 300.0
-CANDIDATE_DEFAULT_INTERVAL_S = 300.0
-CANDIDATE_MAX_INTERVAL_S = 600.0
+CANDIDATE_DEFAULT_INTERVAL_S = 1800.0
+CANDIDATE_MAX_INTERVAL_S = 3600.0
 
 # A window whose binding pct moved at least this much between polls is being
 # consumed somewhere (this machine, another PC, session mode) → tighten; an
