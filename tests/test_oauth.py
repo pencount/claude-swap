@@ -150,32 +150,6 @@ class TestRelevantWindows:
         assert oauth.relevant_windows("no credentials") == []
 
 
-class TestModelUsageWindows:
-    def test_matches_configured_names_case_insensitively(self):
-        usage = {
-            "scoped": [
-                {"name": "Fable", "pct": 64.0},
-                {"name": "Opus", "pct": 22.0},
-                {"name": "Haiku", "pct": 10.0},
-            ]
-        }
-        assert oauth.model_usage_windows(usage, ("fable", "OPUS")) == [
-            {"name": "Fable", "pct": 64.0},
-            {"name": "Opus", "pct": 22.0},
-        ]
-
-    def test_missing_or_malformed_scoped_data_returns_empty(self):
-        assert oauth.model_usage_windows(None, ("Fable",)) == []
-        assert oauth.model_usage_windows({}, ("Fable",)) == []
-        assert oauth.model_usage_windows({"scoped": "bad"}, ("Fable",)) == []
-        assert oauth.model_usage_windows(
-            {"scoped": [{"name": None, "pct": 10.0}]}, ("Fable",)
-        ) == []
-        assert oauth.model_usage_windows(
-            {"scoped": [{"name": "Fable", "pct": 10.0}]}, ()
-        ) == []
-
-
 class TestFormatReset:
     """Test format_reset."""
 

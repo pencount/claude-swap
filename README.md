@@ -89,7 +89,6 @@ cswap auto --model Fable       # also switch when the Fable weekly limit is hit
 cswap auto --model Fable,Opus  # ...or any of several models
 cswap auto --strategy safe-burn # prefer expiring model/weekly quota, with reserve
 cswap auto --drain-window 12   # relax only model reserve near its weekly reset
-cswap auto --reserved-accounts 7 # track slot 7 but never auto-select it
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
 ```
@@ -107,7 +106,6 @@ cswap auto --dry-run           # log what it would do, never switch
   - **Model names** are Anthropic's own per-model `display_name`s, matched case-insensitively. The exact strings for your accounts are the per-model rows in `cswap list` (e.g. a line reading `Fable: 100%`). At the time of writing the values seen are `Fable`, `Opus`, `Sonnet`, and `Haiku`, but the list follows whatever the usage API reports — a name that never matches simply has no effect.
 - Strategies (`--strategy`, or `cswap config set autoswitch.strategy`): `best` (default) stays put until the active account nears its binding limit, then moves to the account with the most headroom. `safe-burn` prefers the account whose configured model/weekly quota resets soonest, but normally leaves accounts at the threshold so long Fable turns keep a reserve. With `--model Fable`, safe-burn ranks by Fable reset when present and falls back to the account-wide 7d reset.
 - Optional model drain (`--drain-window HOURS`, or `autoswitch.drainWindowHours`) lets safe-burn revisit expiring model quota as its reset approaches. During that final window, only the configured model threshold rises linearly from the base threshold toward `autoswitch.drainThreshold` (default 98%); the 5h and account-wide 7d thresholds never move. A zero-hour window disables draining.
-- Reserved accounts (`--reserved-accounts`, or `autoswitch.reservedAccounts`) remain visible and continue refreshing, but are never automatic switch targets. Use comma-separated slot numbers or full emails. Manual `cswap switch` commands remain an explicit override.
 
 For cron/systemd timers, `--once` reports the outcome in its exit code (`0` switched, `1` error, `2` nothing to do, `3` blocked — no viable target), and `--json` emits one JSON event per line:
 
@@ -251,7 +249,6 @@ cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fa
 cswap config set autoswitch.strategy safe-burn  # use expiring model/weekly quota first
 cswap config set autoswitch.drainWindowHours 12 # ramp model reserve in its final 12h
 cswap config set autoswitch.drainThreshold 98    # keep a 2% final emergency margin
-cswap config set autoswitch.reservedAccounts 7   # reserve slot 7 for another surface
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```

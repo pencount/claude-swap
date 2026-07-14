@@ -58,7 +58,6 @@ from claude_swap.poll_policy import (
 from claude_swap.settings import (
     AutoSwitchSettings,
     atomic_write_json,
-    is_reserved_account,
     parse_model_names,
 )
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -377,11 +376,6 @@ class TickOutcome(enum.Enum):
 _refresh_fingerprint = oauth.credential_fingerprint
 
 
-def _model_windows(usage: dict, models: Sequence[str]) -> list[dict]:
-    """Scoped windows matching configured model display names."""
-    return oauth.model_usage_windows(usage, models)
-
-
 def _window_pcts(
     usage: dict | None, models: tuple[str, ...] = ()
 ) -> dict[str, float]:
@@ -404,9 +398,19 @@ _earliest_future_reset_ts = poll_policy.earliest_future_reset_ts
 _parse_reset_ts = poll_policy.parse_reset_ts
 
 
-def _window_reset_ts(window: dict) -> float | None:
-    """Parse a normalized usage window's reset timestamp."""
-    return _parse_reset_ts(window.get("resets_at"))
+def _scoped_relevant_windows(
+    usage: dict,
+    models: Sequence[str],
+) -> list[tuple[str, float, str | None]]:
+    """Configured model windows from oauth's canonical relevant-window list."""
+    windows = oauth.relevant_windows(usage, models)
+    standard_count = sum(
+        1
+        for key in ("five_hour", "seven_day")
+        if isinstance(usage.get(key), dict)
+        and isinstance(usage[key].get("pct"), (int, float))
+    )
+    return windows[standard_count:]
 
 
 def _deadline_reset_ts(usage: dict | str | None, models: Sequence[str]) -> float | None:
@@ -420,14 +424,15 @@ def _deadline_reset_ts(usage: dict | str | None, models: Sequence[str]) -> float
     if not isinstance(usage, dict):
         return None
     scoped_resets = [
-        ts for ts in (_window_reset_ts(w) for w in _model_windows(usage, models))
-        if ts is not None
+        ts
+        for _label, _pct, resets_at in _scoped_relevant_windows(usage, models)
+        if (ts := _parse_reset_ts(resets_at)) is not None
     ]
     if scoped_resets:
         return min(scoped_resets)
     seven_day = usage.get("seven_day")
     if isinstance(seven_day, dict):
-        return _window_reset_ts(seven_day)
+        return _parse_reset_ts(seven_day.get("resets_at"))
     return None
 
 
@@ -448,7 +453,7 @@ class _QuotaThresholdState:
 
 
 def _model_drain_threshold(
-    window: dict,
+    resets_at: str | None,
     settings: AutoSwitchSettings,
     now: float,
 ) -> float:
@@ -460,7 +465,7 @@ def _model_drain_threshold(
     """
     base = settings.threshold
     duration = settings.drain_window_hours * 3600.0
-    reset_ts = _window_reset_ts(window)
+    reset_ts = _parse_reset_ts(resets_at)
     if duration <= 0 or reset_ts is None:
         return base
     remaining = reset_ts - now
@@ -496,16 +501,13 @@ def _quota_threshold_state(
         pct = window.get("pct") if isinstance(window, dict) else None
         if isinstance(pct, (int, float)):
             checks.append((float(pct), settings.threshold, label))
-    for window in _model_windows(usage, models):
-        pct = window.get("pct")
-        if not isinstance(pct, (int, float)):
-            continue
+    for label, pct, resets_at in _scoped_relevant_windows(usage, models):
         threshold = (
-            _model_drain_threshold(window, settings, now)
+            _model_drain_threshold(resets_at, settings, now)
             if allow_model_drain
             else settings.threshold
         )
-        checks.append((float(pct), threshold, str(window["name"])))
+        checks.append((pct, threshold, label))
     if not checks:
         return None
     utilization, threshold, label = min(
@@ -1012,21 +1014,11 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         # -- candidate selection ------------------------------------------
-        switchable = [
+        candidates = [
             num
             for num in self.switcher.switchable_account_numbers()
             if num != current and num not in quarantined
         ]
-        reserved = {
-            num
-            for num in switchable
-            if is_reserved_account(
-                num,
-                self.switcher.account_email(num),
-                settings,
-            )
-        }
-        candidates = [num for num in switchable if num not in reserved]
         oauth_candidates = [
             n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
         ]
@@ -1039,16 +1031,7 @@ class AutoSwitchEngine:
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.
             self._blocked_wait_long = True
-            self._emit(
-                NoSwitchEvent(
-                    reason="no-candidates",
-                    detail=(
-                        "all other accounts are reserved or unavailable"
-                        if reserved
-                        else ""
-                    ),
-                )
-            )
+            self._emit(NoSwitchEvent(reason="no-candidates"))
             return TickOutcome.BLOCKED
 
         active_deadline = (

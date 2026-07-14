@@ -442,7 +442,6 @@ Examples:
   cswap auto --model Fable         # also switch when the Fable weekly limit is hit
   cswap auto --strategy safe-burn  # prefer soonest-resetting Fable/weekly quota
   cswap auto --drain-window 12     # relax only Fable's reserve near its reset
-  cswap auto --reserved-accounts 7 # never auto-select slot 7 (still tracked)
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
   cswap auto --dry-run             # log decisions, never actually switch
@@ -507,14 +506,6 @@ Defaults live in settings.json in the backup root; flags override them.
         help=(
             "Configured-model threshold reached just before reset during "
             "the drain window (50-99.9; default 98)"
-        ),
-    )
-    parser.add_argument(
-        "--reserved-accounts",
-        metavar="REFS",
-        help=(
-            "Comma-separated slot numbers or emails that remain tracked but "
-            "are never selected automatically"
         ),
     )
     parser.add_argument(

@@ -26,16 +26,14 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_swap import oauth
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
-from claude_swap.settings import is_reserved_account
 from claude_swap.switcher import SENTINEL_NOTES
 from claude_swap.tui.data import format_duration
 
 ICON = "⇄"
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95, 98)
-TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "model", "both", "all")
+TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
 SWITCH_HISTORY_LIMIT = 10
 NOTIFICATION_BUNDLE_ID = "com.claude-swap.menubar"
 # Display age is deliberately more sensitive than the backend's 180-second
@@ -217,11 +215,7 @@ def _rolled_weekly_window(window: dict | None, now: float) -> dict | None:
     return rolled
 
 
-def usage_summary(
-    usage: dict | str | None,
-    now: float | None = None,
-    models: tuple[str, ...] = (),
-) -> str:
+def usage_summary(usage: dict | str | None, now: float | None = None) -> str:
     """One-line usage summary for an account row (reset countdown computed live)."""
     if isinstance(usage, str):
         return usage
@@ -241,12 +235,7 @@ def usage_summary(
                 seg += f" ({countdown})"  # time until this window resets
             parts.append(seg)
     # Per-model weekly limits (e.g. Fable), from the usage API's ``limits`` array.
-    scoped = (
-        oauth.model_usage_windows(usage, models)
-        if models
-        else usage.get("scoped") or []
-    )
-    for window in scoped:
+    for window in usage.get("scoped") or []:
         window = _rolled_weekly_window(window, now)  # weekly cadence, same roll-forward
         if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
             seg = f"{window['name']} {window['pct']:.0f}%"
@@ -267,16 +256,12 @@ def format_account_label(
     email: str,
     usage: dict | str | None,
     now: float | None = None,
-    models: tuple[str, ...] = (),
     age_s: float | None = None,
-    reserved: bool = False,
     alias: str | None = None,
 ) -> str:
     """Build one account row's menu label."""
     identity = f"{alias}  ({email})" if alias else email
-    label = f"{num}  {identity}  {usage_summary(usage, now, models)}"
-    if reserved:
-        label += " · reserved"
+    label = f"{num}  {identity}  {usage_summary(usage, now)}"
     age = (
         f"· {format_duration(age_s)} ago"
         if isinstance(usage, dict)
@@ -302,7 +287,6 @@ def format_title(
     active_usage: dict | str | None,
     settings: MenuBarSettings,
     now: float | None = None,
-    models: tuple[str, ...] = (),
     active_age_s: float | None = None,
     active_error: str | None = None,
     alias: str | None = None,
@@ -315,30 +299,25 @@ def format_title(
     segments: list[str] = []
     if settings.show_account_name:
         segments.append(alias if alias else _local_part(active_email))
-    if settings.title_pct in ("5h", "both", "all"):
+    if settings.title_pct in ("5h", "both"):
         p = _window_pct(active_usage, "five_hour")
         if p is not None:
             segments.append(f"{p:.0f}%")
-    if settings.title_pct in ("7d", "both", "all"):
+    if settings.title_pct in ("7d", "both"):
         seven = active_usage.get("seven_day") if isinstance(active_usage, dict) else None
         seven = _rolled_weekly_window(seven, now)  # reflect a passed weekly reset
         p = seven["pct"] if isinstance(seven, dict) and isinstance(seven.get("pct"), (int, float)) else None
         if p is not None:
             segments.append(f"{p:.0f}%")
-    if settings.title_pct in ("model", "all"):
-        scoped = oauth.model_usage_windows(active_usage, models)
-    elif settings.title_scoped and isinstance(active_usage, dict):
-        scoped = active_usage.get("scoped") or []
-    else:
-        scoped = []
-    for window in scoped:
-        window = _rolled_weekly_window(window, now)
-        if (
-            isinstance(window, dict)
-            and isinstance(window.get("pct"), (int, float))
-            and window.get("name")
-        ):
-            segments.append(f"{window['name']} {window['pct']:.0f}%")
+    if settings.title_scoped and isinstance(active_usage, dict):
+        for window in active_usage.get("scoped") or []:
+            window = _rolled_weekly_window(window, now)
+            if (
+                isinstance(window, dict)
+                and isinstance(window.get("pct"), (int, float))
+                and window.get("name")
+            ):
+                segments.append(f"{window['name']} {window['pct']:.0f}%")
     if active_error or (
         active_age_s is not None and active_age_s >= DISPLAY_STALE_S
     ):
@@ -350,11 +329,7 @@ def format_title(
     return f"{ICON} " + " · ".join(segments)
 
 
-def format_usage_log(
-    email: str,
-    usage: dict | str | None,
-    models: tuple[str, ...] = (),
-) -> str | None:
+def format_usage_log(email: str, usage: dict | str | None) -> str | None:
     """A log line of an account's session (5h) and weekly (7d) limits.
 
     Uses each window's absolute reset ``clock`` rather than a live countdown,
@@ -373,39 +348,18 @@ def format_usage_log(
         if clock:
             seg += f" (resets {clock})"
         parts.append(seg)
-    for window in oauth.model_usage_windows(usage, models):
-        pct = window.get("pct")
-        if not isinstance(pct, (int, float)):
-            continue
-        seg = f"{window['name']} {pct:.0f}%"
-        clock = window.get("clock")
-        if clock:
-            seg += f" (resets {clock})"
-        parts.append(seg)
     if not parts:
         return None
     return f"usage {email}: " + " · ".join(parts)
 
 
-def _usage_log_key(
-    usage: dict | str | None,
-    models: tuple[str, ...] = (),
-) -> tuple[float | None, ...]:
+def _usage_log_key(usage: dict | str | None) -> tuple[float | None, float | None]:
     """De-dupe key for usage logging: the (5h, 7d) percentages only.
 
     Reset clocks change every refresh; keying on the percentages means an idle
     account isn't re-logged every cycle.
     """
-    model_pcts = tuple(
-        float(window["pct"])
-        for window in oauth.model_usage_windows(usage, models)
-        if isinstance(window.get("pct"), (int, float))
-    )
-    return (
-        _window_pct(usage, "five_hour"),
-        _window_pct(usage, "seven_day"),
-        *model_pcts,
-    )
+    return (_window_pct(usage, "five_hour"), _window_pct(usage, "seven_day"))
 
 
 _SWITCH_LOG_RE = re.compile(r"Switched from account (\d+) to (\d+)")
@@ -576,12 +530,11 @@ def run(switcher) -> int:
             but de-dupes per account on the (5h, 7d) percentages so an idle
             machine doesn't churn the rotating log with identical lines.
             """
-            models = self._models()
             for num, email, _is_active, _display, last_good, _age_s, _alias in snap["accounts"]:
-                key = _usage_log_key(last_good, models)
+                key = _usage_log_key(last_good)
                 if key == (None, None) or self._last_usage_log.get(num) == key:
                     continue
-                line = format_usage_log(email, last_good, models)
+                line = format_usage_log(email, last_good)
                 if line:
                     self.switcher._logger.info(line)
                     self._last_usage_log[num] = key
@@ -693,25 +646,12 @@ def run(switcher) -> int:
             except Exception:
                 return 0
 
-        def _models(self) -> tuple[str, ...]:
-            """Configured model names shared with the auto-switch engine."""
-            try:
-                return load_settings(self.switcher.backup_dir).models
-            except Exception:
-                return ()
-
         # ---- menu construction -----------------------------------------------
         def rebuild_menu(self):
-            try:
-                auto_settings = load_settings(self.switcher.backup_dir)
-            except Exception:
-                auto_settings = None
-            models = auto_settings.models if auto_settings else ()
             self.title = format_title(
                 self.snapshot["active_email"],
                 self.snapshot["active_usage"],
                 self.settings,
-                models=models,
                 active_age_s=self.snapshot["active_age_s"],
                 active_error=self.snapshot["active_error"],
                 alias=self.snapshot.get("active_alias"),
@@ -732,12 +672,7 @@ def run(switcher) -> int:
                         num,
                         email,
                         display,
-                        models=models,
                         age_s=age_s,
-                        reserved=(
-                            is_reserved_account(num, email, auto_settings)
-                            if auto_settings else False
-                        ),
                         alias=alias,
                     ),
                     callback=self._make_switch_to(num),
@@ -808,9 +743,7 @@ def run(switcher) -> int:
                 "off": "None",
                 "5h": "Session (5h)",
                 "7d": "Weekly (7d)",
-                "model": "Configured model",
                 "both": "Both (5h · 7d)",
-                "all": "5h · 7d · configured model",
             }
             for mode in TITLE_PCT_CHOICES:
                 ch = rumps.MenuItem(tp_labels[mode], callback=self._make_title_pct(mode))

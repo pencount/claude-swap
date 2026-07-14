@@ -106,22 +106,6 @@ def test_usage_summary_dict():
     assert menubar.usage_summary(_USAGE) == "5h 42% · 7d 18% · $ 30%"
 
 
-def test_usage_summary_can_filter_to_configured_models():
-    usage = {
-        **_USAGE,
-        "scoped": [
-            {"name": "Fable", "pct": 64.0},
-            {"name": "Opus", "pct": 22.0},
-        ],
-    }
-    assert menubar.usage_summary(usage, models=("fable",)) == (
-        "5h 42% · 7d 18% · Fable 64% · $ 30%"
-    )
-    assert menubar.usage_summary(usage) == (
-        "5h 42% · 7d 18% · Fable 64% · Opus 22% · $ 30%"
-    )
-
-
 def test_usage_summary_partial_windows():
     assert menubar.usage_summary({"five_hour": {"pct": 5.0}}) == "5h 5%"
 
@@ -177,16 +161,6 @@ def test_format_account_label_marks_stale_numeric_usage_only():
     assert "ago" not in sentinel
 
 
-def test_format_account_label_marks_reserved_account():
-    label = menubar.format_account_label(
-        7,
-        "desktop@example.com",
-        _USAGE,
-        reserved=True,
-    )
-    assert label.endswith("· reserved")
-
-
 def test_format_account_label_with_alias():
     label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, alias="dev")
     assert label == "2  dev  (loc@papaya.asia)  5h 42% · 7d 18% · $ 30%"
@@ -201,17 +175,6 @@ def test_format_usage_log_full():
     }
     assert menubar.format_usage_log("a@x.com", usage) == (
         "usage a@x.com: 5h 35% (resets 06:59) · 7d 55% (resets Jun 29 21:59)"
-    )
-
-
-def test_format_usage_log_tracks_configured_model():
-    usage = {
-        "five_hour": {"pct": 35.0},
-        "seven_day": {"pct": 55.0},
-        "scoped": [{"name": "Fable", "pct": 64.0, "clock": "Jul 10 03:00"}],
-    }
-    assert menubar.format_usage_log("a@x.com", usage, ("Fable",)) == (
-        "usage a@x.com: 5h 35% · 7d 55% · Fable 64% (resets Jul 10 03:00)"
     )
 
 
@@ -238,14 +201,6 @@ def test_usage_log_key_ignores_clock_tracks_pct():
     assert menubar._usage_log_key(u1) == menubar._usage_log_key(u2)  # clock-only change
     assert menubar._usage_log_key(u1) != menubar._usage_log_key(u3)  # pct change
     assert menubar._usage_log_key(None) == (None, None)
-
-
-def test_usage_log_key_tracks_configured_model_pct():
-    first = {**_USAGE, "scoped": [{"name": "Fable", "pct": 64.0}]}
-    second = {**_USAGE, "scoped": [{"name": "Fable", "pct": 65.0}]}
-    assert menubar._usage_log_key(first, ("Fable",)) != menubar._usage_log_key(
-        second, ("Fable",)
-    )
 
 
 # --- title ---------------------------------------------------------------------
@@ -283,26 +238,6 @@ def test_format_title_both_windows():
 def test_format_title_both_windows_with_name():
     s = menubar.MenuBarSettings(show_account_name=True, title_pct="both")
     assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc · 42% · 18%"
-
-
-def test_format_title_all_includes_configured_model():
-    usage = {**_USAGE, "scoped": [{"name": "Fable", "pct": 64.0}]}
-    settings = menubar.MenuBarSettings(show_account_name=False, title_pct="all")
-    assert menubar.format_title(
-        "loc@papaya.asia", usage, settings, models=("Fable",)
-    ) == (
-        "⇄ 42% · 18% · Fable 64%"
-    )
-
-
-def test_format_title_model_only():
-    usage = {**_USAGE, "scoped": [{"name": "Fable", "pct": 64.0}]}
-    settings = menubar.MenuBarSettings(show_account_name=False, title_pct="model")
-    assert menubar.format_title(
-        "loc@papaya.asia", usage, settings, models=("Fable",)
-    ) == (
-        "⇄ Fable 64%"
-    )
 
 
 def test_format_title_icon_only_when_off():
@@ -421,7 +356,7 @@ def test_usage_summary_model_countdown_is_live():
             {"name": "Fable", "pct": 64.0, "resets_at": _iso(3 * 3600 + 5 * 60)}
         ],
     }
-    assert menubar.usage_summary(usage, _NOW, models=("Fable",)) == (
+    assert menubar.usage_summary(usage, _NOW) == (
         "5h 42% · 7d 18% · Fable 64% (3h 5m)"
     )
 

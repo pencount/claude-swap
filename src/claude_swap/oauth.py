@@ -457,29 +457,6 @@ def build_usage_result(data: dict) -> dict | None:
     return result if result else None
 
 
-def model_usage_windows(usage: dict | None, models: Sequence[str]) -> list[dict]:
-    """Scoped weekly usage windows matching model display names.
-
-    Matching is case-insensitive because the setting is user-authored while
-    display names come from the usage API. Malformed/absent scoped data simply
-    yields no matches, preserving compatibility with older API responses.
-    """
-    if not isinstance(usage, dict) or not models:
-        return []
-    scoped = usage.get("scoped")
-    if not isinstance(scoped, list):
-        return []
-    wanted = {model.lower() for model in models}
-    match_all = "all" in wanted
-    return [
-        window
-        for window in scoped
-        if isinstance(window, dict)
-        and isinstance(window.get("name"), str)
-        and (match_all or window["name"].lower() in wanted)
-    ]
-
-
 def relevant_windows(
     usage: dict | None, models: Sequence[str] = ()
 ) -> list[tuple[str, float, str | None]]:
