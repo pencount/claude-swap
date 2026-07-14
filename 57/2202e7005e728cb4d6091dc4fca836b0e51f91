@@ -1,0 +1,31 @@
+src/claude_swap/poll_policy.py
+  s_51f06d0600a287::t_8943f39ce1492b 60-61,63-64
+tests/test_poll_policy.py
+  s_51f06d0600a287::t_8943f39ce1492b 46-48,131
+tests/test_autoswitch.py
+  s_51f06d0600a287::t_8943f39ce1492b 365-383,772-776,790-791,794-796,851,853,855,858-859,863
+tests/test_usage_store.py
+  s_51f06d0600a287::t_8943f39ce1492b 212,217-218
+  s_51f06d0600a287::t_418b07a1f504c8 219
+src/claude_swap/autoswitch.py
+  s_51f06d0600a287::t_8943f39ce1492b 23-26,932-937,939-945,1152-1153,1164-1166,1252-1253,1303-1315,1317,1338
+  s_51f06d0600a287::t_6c0cb28d0a1835 1302
+src/claude_swap/usage_store.py
+  s_51f06d0600a287::t_8943f39ce1492b 71-73
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "572202e7005e728cb4d6091dc4fca836b0e51f91",
+  "prompts": {},
+  "sessions": {
+    "s_51f06d0600a287": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f3dea-c608-7cb3-89a9-e551c8713c45",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "pencount <149122028+pencount@users.noreply.github.com>"
+    }
+  }
+}
