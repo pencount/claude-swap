@@ -258,10 +258,12 @@ def format_account_label(
     now: float | None = None,
     age_s: float | None = None,
     alias: str | None = None,
+    disabled: bool = False,
 ) -> str:
     """Build one account row's menu label."""
     identity = f"{alias}  ({email})" if alias else email
-    label = f"{num}  {identity}  {usage_summary(usage, now)}"
+    marker = "  (disabled)" if disabled else ""
+    label = f"{num}  {identity}{marker}  {usage_summary(usage, now)}"
     age = (
         f"· {format_duration(age_s)} ago"
         if isinstance(usage, dict)
@@ -408,7 +410,7 @@ def _adapt_snapshot(snap) -> dict:
     """Adapt an ``AccountsSnapshot`` to the menu bar's render dict.
 
     Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good,
-    age_s, alias), ...],
+    age_s, alias, disabled), ...],
     "active_email": str | None, "active_usage": dict | str | None,
     "active_alias": str | None}``. The snapshot itself is produced by
     ``SnapshotSource`` (the paced read path), so this is a pure transform — no
@@ -431,6 +433,7 @@ def _adapt_snapshot(snap) -> dict:
                 acc.usage.last_good,
                 getattr(acc.usage, "age_s", None),
                 acc.alias,
+                acc.disabled,
             )
         )
         if acc.is_active:
@@ -530,7 +533,16 @@ def run(switcher) -> int:
             but de-dupes per account on the (5h, 7d) percentages so an idle
             machine doesn't churn the rotating log with identical lines.
             """
-            for num, email, _is_active, _display, last_good, _age_s, _alias in snap["accounts"]:
+            for (
+                num,
+                email,
+                _is_active,
+                _display,
+                last_good,
+                _age_s,
+                _alias,
+                _disabled,
+            ) in snap["accounts"]:
                 key = _usage_log_key(last_good)
                 if key == (None, None) or self._last_usage_log.get(num) == key:
                     continue
@@ -666,6 +678,7 @@ def run(switcher) -> int:
                 _last_good,
                 age_s,
                 alias,
+                disabled,
             ) in self.snapshot["accounts"]:
                 item = rumps.MenuItem(
                     format_account_label(
@@ -674,6 +687,7 @@ def run(switcher) -> int:
                         display,
                         age_s=age_s,
                         alias=alias,
+                        disabled=disabled,
                     ),
                     callback=self._make_switch_to(num),
                 )
@@ -690,6 +704,7 @@ def run(switcher) -> int:
                 rumps.MenuItem("Next available", callback=self._switch("next-available")),
                 None,
                 self._add_menu(rumps),
+                self._disable_menu(rumps),
                 self._remove_menu(rumps),
                 rumps.MenuItem("Refresh current credentials", callback=self.on_refresh_creds),
                 self._history_menu(rumps),
@@ -711,9 +726,43 @@ def run(switcher) -> int:
             accounts = self.snapshot["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
-            for num, email, _is_active, _display, _last_good, _age_s, alias in accounts:
+            for (
+                num,
+                email,
+                _is_active,
+                _display,
+                _last_good,
+                _age_s,
+                alias,
+                _disabled,
+            ) in accounts:
                 label = f"{num}  {alias}  ({email})" if alias else f"{num}  {email}"
                 menu.add(rumps.MenuItem(label, callback=self._make_remove(num)))
+            return menu
+
+        def _disable_menu(self, rumps):
+            menu = rumps.MenuItem("Disable / enable account")
+            accounts = self.snapshot["accounts"]
+            if not accounts:
+                menu.add(rumps.MenuItem("No managed accounts", callback=None))
+            for (
+                num,
+                email,
+                _is_active,
+                _display,
+                _last_good,
+                _age_s,
+                alias,
+                disabled,
+            ) in accounts:
+                name = f"{alias}  ({email})" if alias else email
+                item = rumps.MenuItem(
+                    f"{num}  {name}", callback=self._make_toggle_disabled(num, disabled)
+                )
+                # A check-mark reads as "held out of rotation" — same glyph the
+                # active row uses, but here it means disabled, not selected.
+                item.state = 1 if disabled else 0
+                menu.add(item)
             return menu
 
         def _history_menu(self, rumps):
@@ -823,6 +872,16 @@ def run(switcher) -> int:
                 ) == 1:  # 1 == OK
                     if self._guard(lambda: self.switcher.remove_account(str(num), assume_yes=True)):
                         self.refresh_async()
+            return cb
+
+        def _make_toggle_disabled(self, num, disabled):
+            # `disabled` is this row's current state; selecting it flips it.
+            target = not disabled
+            def cb(_sender):
+                if self._guard(
+                    lambda: self.switcher.set_account_disabled(str(num), target)
+                ):
+                    self.refresh_async()
             return cb
 
         def on_add_login(self, _sender):

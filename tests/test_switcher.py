@@ -3757,12 +3757,38 @@ class TestSwitchSkipsBrokenSlots:
         data = s._get_sequence_data()
         assert data["activeAccountNumber"] == 2
 
+    def test_fresh_machine_skips_disabled_preferred_target(
+        self, temp_home: Path, capsys
+    ):
+        """No live session — a disabled recorded active slot stays out of rotation."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_disabled("1", True)
+        capsys.readouterr()
+
+        with patch.object(s, "list_accounts"):
+            s.switch()
+
+        assert "Skipping Account-1 (disabled)" in capsys.readouterr().out
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
     def test_fresh_machine_all_broken_raises(self, temp_home: Path):
         s = self._setup(temp_home)
         self._seed(s, 1, "a@example.com", creds=False)
         self._seed(s, 2, "b@example.com", config=False)
 
         with pytest.raises(ConfigError, match="No managed accounts have valid"):
+            s.switch()
+
+    def test_fresh_machine_all_disabled_raises(self, temp_home: Path):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_disabled("1", True)
+        s.set_account_disabled("2", True)
+
+        with pytest.raises(ConfigError, match="No accounts remain in rotation"):
             s.switch()
 
 
@@ -6283,6 +6309,22 @@ class TestDisableEnableAccount:
         s.set_account_disabled("b@example.com", True)
 
         assert s.is_account_disabled("2") is True
+
+    def test_disable_and_enable_by_alias(self, temp_home):
+        """An alias resolves the same as a number/email (issue: disable/enable
+        must accept aliases now that the alias feature has landed)."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_alias("2", "dev")
+
+        s.set_account_disabled("dev", True)
+        assert s.is_account_disabled("2") is True
+        assert s.switchable_account_numbers() == ["1"]
+
+        s.set_account_disabled("dev", False)
+        assert s.is_account_disabled("2") is False
+        assert s.switchable_account_numbers() == ["1", "2"]
 
     def test_repeated_disable_is_noop(self, temp_home, capsys):
         s = self._setup(temp_home)

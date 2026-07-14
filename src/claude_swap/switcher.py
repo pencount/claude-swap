@@ -738,6 +738,7 @@ class ClaudeAccountSwitcher:
         """
         accounts_info = self._build_accounts_info()
         entries = self._collect_usage_entries(accounts_info, fetch=fetch)
+        seq_data = self._get_sequence_data() or {}
         active_number: str | None = None
         accounts: list[AccountSnapshot] = []
         for num, email, org_name, org_uuid, is_active, _creds, alias in accounts_info:
@@ -755,6 +756,7 @@ class ClaudeAccountSwitcher:
                     switchable=self._account_is_switchable(n),
                     usage=entries[n],
                     alias=alias,
+                    disabled=self._disabled_from_data(seq_data, n),
                 )
             )
         return AccountsSnapshot(
@@ -2910,23 +2912,35 @@ class ClaudeAccountSwitcher:
                 raise ConfigError("No accounts are managed yet")
 
             target = str(preferred)
-            if not self._account_is_switchable(target):
-                if json_output:
-                    warnings.append(
-                        f"Skipped Account-{target} (no stored credentials/config)"
-                    )
+            target_disabled = self._disabled_from_data(data, target)
+            if target_disabled or not self._account_is_switchable(target):
+                if target_disabled:
+                    reason = console_reason = "(disabled)"
                 else:
-                    print(
-                        f"{accent('Skipping')} Account-{target} "
-                        f"(no stored credentials/config, re-add with "
+                    reason = "(no stored credentials/config)"
+                    console_reason = (
+                        "(no stored credentials/config, re-add with "
                         f"cswap --add-account --slot {target})"
                     )
+                if json_output:
+                    warnings.append(f"Skipped Account-{target} {reason}")
+                else:
+                    print(f"{accent('Skipping')} Account-{target} {console_reason}")
                 fallback = next(
                     (str(num) for num in sequence
-                     if str(num) != target and self._account_is_switchable(str(num))),
+                     if str(num) != target
+                     and not self._disabled_from_data(data, str(num))
+                     and self._account_is_switchable(str(num))),
                     None,
                 )
                 if not fallback:
+                    if any(
+                        self._account_is_switchable(str(num)) for num in sequence
+                    ):
+                        raise ConfigError(
+                            "No accounts remain in rotation. Re-enable one with: "
+                            "cswap enable <num|email>"
+                        )
                     raise ConfigError(
                         "No managed accounts have valid stored credentials/config. "
                         "Re-add a slot with: cswap --add-account --slot <number>"
