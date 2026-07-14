@@ -1,0 +1,42 @@
+tests/test_tui.py
+  s_51f06d0600a287::t_a762637484e323 81,93,151-161,498-518,575,715-758
+  s_51f06d0600a287::t_5a542d68c29f8c 759
+tests/test_menubar.py
+  s_51f06d0600a287::t_a762637484e323 169-173,417,423
+  s_51f06d0600a287::t_d617aa9e74f93b 451-457,465-467,476
+src/claude_swap/menubar.py
+  s_51f06d0600a287::t_d617aa9e74f93b 265-266,413,436,536-545,681,690,729-738,748-757
+  s_51f06d0600a287::t_a762637484e323 261,707,743-747,758-767,877-884
+  s_51f06d0600a287::t_2b9864d530b02a 885-886
+tests/test_switcher.py
+  s_51f06d0600a287::t_a762637484e323 3760-3775,3784-3793,6313-6327
+  s_51f06d0600a287::t_fe2e55c80b3e21 6328
+src/claude_swap/switcher.py
+  s_51f06d0600a287::t_a762637484e323 741,759,2915-2918,2920-2922,2925-2928,2931-2933,2937-2943
+src/claude_swap/tui/dashboard.py
+  s_51f06d0600a287::t_a762637484e323 81,106-120,171-176
+src/claude_swap/models.py
+  s_51f06d0600a287::t_a762637484e323 142
+README.md
+  s_51f06d0600a287::t_d617aa9e74f93b 101-102,104,231
+src/claude_swap/tui/app.py
+  s_51f06d0600a287::t_a762637484e323 183-198
+src/claude_swap/tui/widgets.py
+  s_51f06d0600a287::t_a762637484e323 168-169,238-239
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.13",
+  "base_commit_sha": "b52c88d0e54ebcf6e8d6d36bec9cb3a2cbf9dad8",
+  "prompts": {},
+  "sessions": {
+    "s_51f06d0600a287": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f3dea-c608-7cb3-89a9-e551c8713c45",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "pencount <149122028+pencount@users.noreply.github.com>"
+    }
+  }
+}
