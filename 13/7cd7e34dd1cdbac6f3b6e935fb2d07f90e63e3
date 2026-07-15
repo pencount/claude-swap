@@ -1,0 +1,28 @@
+src/claude_swap/transfer.py
+  s_51f06d0600a287::t_ee5757ed181055 434-446,480-488
+  s_51f06d0600a287::t_bf51367ebff82b 489
+pyproject.toml
+  s_51f06d0600a287::t_ee5757ed181055 3
+README.md
+  s_51f06d0600a287::t_ee5757ed181055 103,213
+tests/test_transfer.py
+  s_51f06d0600a287::t_ee5757ed181055 18,1378-1510
+uv.lock
+  s_51f06d0600a287::t_736e0da5cbf34e 44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "137cd7e34dd1cdbac6f3b6e935fb2d07f90e63e3",
+  "prompts": {},
+  "sessions": {
+    "s_51f06d0600a287": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f3dea-c608-7cb3-89a9-e551c8713c45",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "pencount <149122028+pencount@users.noreply.github.com>"
+    }
+  }
+}
