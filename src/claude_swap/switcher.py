@@ -410,6 +410,49 @@ class ClaudeAccountSwitcher:
     def _write_credentials(self, credentials: str) -> None:
         self._store._write_credentials(credentials)
 
+    def _compose_activation_credentials(
+        self, target_credentials: str, live_credentials: str | None
+    ) -> str:
+        """Swap the Claude login without reverting shared OAuth stores.
+
+        Claude Code keeps ``claudeAiOauth`` beside account-independent stores
+        such as ``mcpOAuth`` and ``designOauth`` in one credential object. Slot
+        backups therefore contain snapshots of those shared stores, but only
+        ``claudeAiOauth`` belongs to the account being activated. Carry the
+        current live siblings forward so a switch cannot restore stale MCP
+        refresh tokens from the target slot.
+
+        Raw API-key accounts and unreadable/non-object payloads retain the
+        existing whole-value activation behavior.
+        """
+        if not live_credentials or looks_like_api_key(target_credentials):
+            return target_credentials
+
+        try:
+            target_data = json.loads(target_credentials)
+            live_data = json.loads(live_credentials)
+        except (json.JSONDecodeError, TypeError):
+            return target_credentials
+
+        if not isinstance(target_data, dict) or not isinstance(live_data, dict):
+            return target_credentials
+        if "claudeAiOauth" not in target_data:
+            return target_credentials
+
+        merged = {"claudeAiOauth": target_data["claudeAiOauth"]}
+        merged.update(
+            (key, value)
+            for key, value in live_data.items()
+            if key != "claudeAiOauth"
+        )
+        preserved = sorted(key for key in merged if key != "claudeAiOauth")
+        if preserved:
+            self._logger.info(
+                "Preserved live shared credential stores while switching: %s",
+                ", ".join(preserved),
+            )
+        return json.dumps(merged)
+
     def _uses_file_backup_backend(self) -> bool:
         return self._store._uses_file_backup_backend()
 
@@ -3761,11 +3804,13 @@ class ClaudeAccountSwitcher:
                 # Snapshot live state so a mid-operation failure can be undone.
                 # When a live session exists, fail fast if the snapshot is
                 # unreadable rather than proceeding to overwrite without a
-                # safety net. The fresh-machine case has nothing to restore.
+                # safety net. Read even without a Claude identity because the
+                # credential object may still contain live MCP OAuth tokens.
+                live_creds = self._read_credentials()
                 rollback_creds: str | None = None
                 rollback_config_text: str | None = None
                 if current_identity is not None:
-                    rollback_creds = self._read_credentials()
+                    rollback_creds = live_creds
                     if rollback_creds is None:
                         raise CredentialReadError(
                             "Cannot snapshot live credentials before activation"
@@ -3819,7 +3864,10 @@ class ClaudeAccountSwitcher:
                 creds_written = False
                 config_written = False
                 try:
-                    self._write_credentials(target_creds)
+                    activation_creds = self._compose_activation_credentials(
+                        target_creds, live_creds
+                    )
+                    self._write_credentials(activation_creds)
                     creds_written = True
 
                     # Mirror the normal switch path: preserve existing local
@@ -4036,7 +4084,10 @@ class ClaudeAccountSwitcher:
                     )
 
                 # Step 3: Activate target account - credentials
-                self._write_credentials(target_creds)
+                activation_creds = self._compose_activation_credentials(
+                    target_creds, original_creds
+                )
+                self._write_credentials(activation_creds)
                 transaction.record_step("credentials_written")
                 self._logger.info("Wrote target credentials")
 
