@@ -1,0 +1,22 @@
+src/claude_swap/switcher.py
+  s_51f06d0600a287::t_a29ed3d8718988 413-415,417-418,422,425,428-437,4045-4054,4106-4107,4325-4326
+tests/test_switcher.py
+  s_51f06d0600a287::t_8c3144eaddbb46 1719-1721,1731,2236-2237
+  s_51f06d0600a287::t_9594122df69a85 5891-5949,5959,5965,5984,5987,5994-5997,6002,6007-6027,6030-6034,6036
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "6a7439217f8326fd591b540286f87c11183fa3ca",
+  "prompts": {},
+  "sessions": {
+    "s_51f06d0600a287": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f3dea-c608-7cb3-89a9-e551c8713c45",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "pencount <149122028+pencount@users.noreply.github.com>"
+    }
+  }
+}
