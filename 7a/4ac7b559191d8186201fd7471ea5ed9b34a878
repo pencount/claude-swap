@@ -1,0 +1,39 @@
+src/claude_swap/macos_keychain.py
+  s_acffc1c7ce53c2::t_50687c2863b862 205,208-211,225-228
+src/claude_swap/switcher.py
+  s_acffc1c7ce53c2::t_860efaed5dd404 449-456
+  s_acffc1c7ce53c2::t_b6723904943e34 419-422,431-435,437-441,457-461,468-470
+  s_acffc1c7ce53c2::t_5668d062319500 4106-4109,4112-4115,4119-4124,4126-4134
+  s_acffc1c7ce53c2::t_c4203ebb3759df 4177-4182
+  s_acffc1c7ce53c2::t_d16bbb70fab9cf 42
+  s_acffc1c7ce53c2::t_1f61c00eac8290 4260-4261
+  s_acffc1c7ce53c2::t_8ffbf89285cce7 4353-4381
+  s_acffc1c7ce53c2::t_ed4168f0b9cb28 4429-4433
+  s_acffc1c7ce53c2::t_c1be04b09dfa52 4626-4641
+  s_acffc1c7ce53c2::t_ddb2d3e1fcaa13 4205,4207-4218
+src/claude_swap/credentials.py
+  s_acffc1c7ce53c2::t_60778d85b276ca 50
+  s_acffc1c7ce53c2::t_bb0f2933c841c1 90-93,98
+  s_acffc1c7ce53c2::t_3ed56a123affdb 719-721,727-731,738,740,744-753,758-764,766-768,779-805,808
+  s_acffc1c7ce53c2::t_8890466227e96e 838-842
+  s_acffc1c7ce53c2::t_b54fd9aaa782e3 348-358
+tests/test_switcher.py
+  s_acffc1c7ce53c2::t_301a05b0bcec24 4781-4795
+  s_acffc1c7ce53c2::t_bc90c51d9ffb56 6317-6550
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "7a4ac7b559191d8186201fd7471ea5ed9b34a878",
+  "prompts": {},
+  "sessions": {
+    "s_acffc1c7ce53c2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "29ef2834-9718-469b-8063-b659e060c12c",
+        "model": "claude-fable-5"
+      },
+      "human_author": "pencount <149122028+pencount@users.noreply.github.com>"
+    }
+  }
+}
