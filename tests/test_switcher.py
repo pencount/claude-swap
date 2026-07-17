@@ -6264,6 +6264,61 @@ class TestSharedOAuthCredentialPreservation:
             "server": {"refreshToken": "mcp-current"},
         }
 
+    def test_direct_activation_preserves_and_rolls_back_mcp_only_state(
+        self, temp_home,
+    ):
+        switcher, _ = TestDirectActivationPreservation()._setup(temp_home)
+        config_path = temp_home / ".claude.json"
+        config_path.write_text("{}")
+        live_path = temp_home / ".claude" / ".credentials.json"
+        mcp_only = json.dumps({
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        })
+        live_path.write_text(mcp_only)
+
+        target = json.loads(
+            switcher._read_account_credentials("1", "one@example.com")
+        )
+        target["mcpOAuth"] = {"server": {"refreshToken": "stale"}}
+        switcher._write_account_credentials(
+            "1", "one@example.com", json.dumps(target)
+        )
+
+        original_write_json = switcher._write_json
+
+        def fail_sequence_write(path, data):
+            if path == switcher.sequence_file and data.get(
+                "activeAccountNumber"
+            ) == 1:
+                raise OSError("disk full")
+            return original_write_json(path, data)
+
+        writes = []
+        original_write_credentials = switcher._write_credentials
+
+        def record_write(credentials):
+            writes.append(json.loads(credentials))
+            original_write_credentials(credentials)
+
+        with patch.object(
+            switcher, "_write_json", side_effect=fail_sequence_write,
+        ), patch.object(
+            switcher, "_write_credentials", side_effect=record_write,
+        ), pytest.raises(OSError, match="disk full"):
+            switcher._perform_switch("1", emit_output=False)
+
+        assert writes[0] == {
+            "claudeAiOauth": {
+                "accessToken": "sk-one", "refreshToken": "rt-one",
+            },
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        }
+        assert live_path.read_text() == mcp_only
+        # The config write must be undone too: restored MCP-only credentials
+        # paired with the target's oauthAccount would poison the next
+        # switch's outgoing-backup step.
+        assert config_path.read_text() == "{}"
+
     def test_fresh_machine_activation_survives_unreadable_keychain(
         self, temp_home,
     ):
@@ -6282,6 +6337,55 @@ class TestSharedOAuthCredentialPreservation:
         )
         assert live["claudeAiOauth"]["accessToken"] == "sk-one"
         assert "mcpOAuth" not in live
+
+    def test_readable_empty_live_state_is_restored_on_failure(self, temp_home):
+        switcher, _ = TestDirectActivationPreservation()._setup(temp_home)
+        live_path = temp_home / ".claude" / ".credentials.json"
+        live_path.write_text("")  # readable-but-empty live store
+
+        original_write_json = switcher._write_json
+
+        def fail_sequence_write(path, data):
+            if path == switcher.sequence_file and data.get(
+                "activeAccountNumber"
+            ) == 1:
+                raise OSError("disk full")
+            return original_write_json(path, data)
+
+        with patch.object(
+            switcher, "_write_json", side_effect=fail_sequence_write,
+        ), pytest.raises(OSError, match="disk full"):
+            switcher._perform_switch("1", emit_output=False)
+
+        # "" is a restorable snapshot: the target's tokens must not be left
+        # behind after the rollback.
+        assert live_path.read_text() == ""
+
+    def test_failed_direct_activation_removes_config_it_created(
+        self, temp_home,
+    ):
+        switcher, _ = TestDirectActivationPreservation()._setup(temp_home)
+        config_path = temp_home / ".claude.json"
+        config_path.unlink()  # fresh machine: no config at all
+        (temp_home / ".claude" / ".credentials.json").unlink()
+
+        original_write_json = switcher._write_json
+
+        def fail_sequence_write(path, data):
+            if path == switcher.sequence_file and data.get(
+                "activeAccountNumber"
+            ) == 1:
+                raise OSError("disk full")
+            return original_write_json(path, data)
+
+        with patch.object(
+            switcher, "_write_json", side_effect=fail_sequence_write,
+        ), pytest.raises(OSError, match="disk full"):
+            switcher._perform_switch("1", emit_output=False)
+
+        # A config left behind would pair the target's oauthAccount with
+        # rolled-back (absent) credentials.
+        assert not config_path.exists()
 
     def test_corrupt_shared_store_recovers_as_uninitialized(self, temp_home):
         switcher = ClaudeAccountSwitcher()

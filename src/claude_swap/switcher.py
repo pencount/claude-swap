@@ -4090,18 +4090,22 @@ class ClaudeAccountSwitcher:
                     raise CredentialReadError(
                         "Cannot snapshot live credentials before activation"
                     )
-                rollback_creds = live_creds or None
+                # An unreadable-Keychain "" is not a trustworthy snapshot;
+                # a readable "" is, and must be restored on failure rather
+                # than leaving the target's tokens behind.
+                rollback_creds: str | None = (
+                    None if active_creds.keychain_unavailable else live_creds
+                )
                 rollback_config_text: str | None = None
-                if current_identity is not None:
-                    if config_path.exists():
-                        try:
-                            rollback_config_text = config_path.read_text(
-                                encoding="utf-8"
-                            )
-                        except OSError as e:
-                            raise ConfigError(
-                                f"Cannot snapshot live config before activation: {e}"
-                            )
+                if config_path.exists():
+                    try:
+                        rollback_config_text = config_path.read_text(
+                            encoding="utf-8"
+                        )
+                    except OSError as e:
+                        raise ConfigError(
+                            f"Cannot snapshot live config before activation: {e}"
+                        )
 
                 # Invariant II (issue #117): this path skips the backup step,
                 # so the live credential it replaces would otherwise have no
@@ -4167,13 +4171,20 @@ class ClaudeAccountSwitcher:
                     data["lastUpdated"] = get_timestamp()
                     self._write_json(self.sequence_file, data)
                 except Exception:
-                    if config_written and rollback_config_text is not None:
+                    if config_written:
                         try:
-                            config_path.write_text(
-                                rollback_config_text, encoding="utf-8"
-                            )
-                            if sys.platform != "win32":
-                                os.chmod(config_path, 0o600)
+                            if rollback_config_text is not None:
+                                config_path.write_text(
+                                    rollback_config_text, encoding="utf-8"
+                                )
+                                if sys.platform != "win32":
+                                    os.chmod(config_path, 0o600)
+                            else:
+                                # No config existed before this switch — a
+                                # partial rollback that leaves the target's
+                                # oauthAccount behind would pair the restored
+                                # credentials with a wrong identity.
+                                config_path.unlink(missing_ok=True)
                         except Exception as e:
                             self._logger.error(
                                 f"Failed to rollback config: {e}"
