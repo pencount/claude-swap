@@ -39,6 +39,7 @@ from claude_swap.json_output import (
 from claude_swap.credentials import (  # noqa: F401  (constants re-exported for migrations/tests)
     CLAUDE_CODE_KEYCHAIN_SERVICE,
     SECURITY_SERVICE,
+    SHARED_CREDENTIALS_USERNAME,
     ActiveCredentials,
     CredentialStore,
     looks_like_api_key,
@@ -409,6 +410,12 @@ class ClaudeAccountSwitcher:
 
     def _write_credentials(self, credentials: str) -> None:
         self._store._write_credentials(credentials)
+
+    def _read_shared_credentials(self) -> str | None:
+        return self._store._read_shared_credentials()
+
+    def _write_shared_credentials(self, credentials: str) -> None:
+        self._store._write_shared_credentials(credentials)
 
     def _uses_file_backup_backend(self) -> bool:
         return self._store._uses_file_backup_backend()

@@ -32,6 +32,7 @@ from claude_swap.switcher import (
     ClaudeAccountSwitcher,
     SECURITY_SERVICE,
     SETUP_TOKEN_SCOPES,
+    SHARED_CREDENTIALS_USERNAME,
     _format_usage_lines,
 )
 
@@ -4706,6 +4707,85 @@ class TestMacosKeychainFallback:
         s._delete_account_credentials("1", "a@example.com")
         assert not s._backup_enc_path("1", "a@example.com").exists()
         assert (SECURITY_SERVICE, "account-1-a@example.com") not in block_real_keychain.data
+
+    def test_shared_store_keychain_write_reconciles_fallback_file(
+        self, temp_home: Path, block_real_keychain
+    ):
+        s = self._macos_switcher()
+        s._store._atomic_b64_write(
+            s._store._shared_credentials_path(), '{"mcpOAuth":{"old":true}}'
+        )
+
+        s._write_shared_credentials('{"mcpOAuth":{"current":true}}')
+
+        assert not s._store._shared_credentials_path().exists()
+        assert block_real_keychain.data[
+            (SECURITY_SERVICE, SHARED_CREDENTIALS_USERNAME)
+        ] == '{"mcpOAuth":{"current":true}}'
+        assert s._read_shared_credentials() == '{"mcpOAuth":{"current":true}}'
+
+    def test_shared_store_file_fallback_wins_over_stale_keychain(
+        self, temp_home: Path, monkeypatch, block_real_keychain
+    ):
+        s = self._macos_switcher()
+        block_real_keychain.data[
+            (SECURITY_SERVICE, SHARED_CREDENTIALS_USERNAME)
+        ] = '{"mcpOAuth":{"stale":true}}'
+        monkeypatch.setattr(macos_keychain, "set_password", _raise_locked)
+
+        s._write_shared_credentials('{"mcpOAuth":{"current":true}}')
+
+        assert s._read_shared_credentials() == '{"mcpOAuth":{"current":true}}'
+        assert (
+            SECURITY_SERVICE, SHARED_CREDENTIALS_USERNAME
+        ) not in block_real_keychain.data
+
+    def test_shared_store_unavailable_is_not_missing(
+        self, temp_home: Path, monkeypatch
+    ):
+        s = self._macos_switcher()
+        monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
+
+        assert s._read_shared_credentials() is None
+
+    def test_shared_store_reads_keychain_while_file_mode_is_pinned(
+        self, temp_home: Path, block_real_keychain
+    ):
+        s = self._macos_switcher()
+        block_real_keychain.data[
+            (SECURITY_SERVICE, SHARED_CREDENTIALS_USERNAME)
+        ] = '{"mcpOAuth":{"current":true}}'
+        s._store._pin_file_mode()
+
+        assert s._read_shared_credentials() == '{"mcpOAuth":{"current":true}}'
+        assert s._keychain_usable_cache is False
+        assert s._keychain_disabled_until == 0.0
+
+    def test_shared_store_pinned_read_failure_does_not_schedule_reprobe(
+        self, temp_home: Path, monkeypatch
+    ):
+        s = self._macos_switcher()
+        s._store._pin_file_mode()
+        monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
+
+        assert s._read_shared_credentials() is None
+        assert s._keychain_usable_cache is False
+        assert s._keychain_disabled_until == 0.0
+
+    def test_shared_store_read_attempts_keychain_during_cooldown(
+        self, temp_home: Path, block_real_keychain
+    ):
+        # A transient failure elsewhere arms the 60s cooldown; the shared
+        # snapshot read must still attempt the Keychain rather than abort
+        # the activation with "unreadable".
+        s = self._macos_switcher()
+        block_real_keychain.data[
+            (SECURITY_SERVICE, SHARED_CREDENTIALS_USERNAME)
+        ] = '{"mcpOAuth":{"current":true}}'
+        s._store._keychain_usable_cache = False
+        s._store._keychain_disabled_until = time.monotonic() + 60.0
+
+        assert s._read_shared_credentials() == '{"mcpOAuth":{"current":true}}'
 
     # -- healthy-Mac no-op guard & follow-up ------------------------------
 
