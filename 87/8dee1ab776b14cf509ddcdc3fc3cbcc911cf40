@@ -1,0 +1,25 @@
+README.md
+  s_acffc1c7ce53c2::t_eaee2cbe39788f 206-208
+src/claude_swap/credentials.py
+  s_acffc1c7ce53c2::t_a5f10119b5fc17 102-149
+src/claude_swap/switcher.py
+  s_acffc1c7ce53c2::t_57f09c0ac002d4 45-46,415-434,4102-4106,4323-4327
+tests/test_switcher.py
+  s_acffc1c7ce53c2::t_87d048c0ca3cfc 5878-6035
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "878dee1ab776b14cf509ddcdc3fc3cbcc911cf40",
+  "prompts": {},
+  "sessions": {
+    "s_acffc1c7ce53c2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "29ef2834-9718-469b-8063-b659e060c12c",
+        "model": "claude-fable-5"
+      },
+      "human_author": "pencount <149122028+pencount@users.noreply.github.com>"
+    }
+  }
+}
