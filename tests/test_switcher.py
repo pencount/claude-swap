@@ -6422,6 +6422,97 @@ class TestSharedOAuthCredentialPreservation:
         assert prev == snapshot
         assert json.loads(switcher._read_shared_credentials()) == {}
 
+    def test_untrusted_live_state_is_not_promoted_to_shared_store(
+        self, temp_home,
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher.platform = Platform.LINUX
+        switcher._setup_directories()
+        switcher._write_shared_credentials(json.dumps({
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        }))
+        stale_live = json.dumps({
+            "claudeAiOauth": {"accessToken": "stale"},
+            "mcpOAuth": {"server": {"refreshToken": "rotated-out"}},
+        })
+        target = json.dumps({"claudeAiOauth": {"accessToken": "target"}})
+
+        composed = json.loads(switcher._prepare_credentials_for_activation(
+            target, stale_live, live_authoritative=False,
+        ))
+
+        assert composed == {
+            "claudeAiOauth": {"accessToken": "target"},
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        }
+        assert json.loads(switcher._read_shared_credentials()) == {
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        }
+
+    def test_activation_refuses_mcp_only_slot_backup(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher.platform = Platform.LINUX
+        switcher._setup_directories()
+        target = json.dumps({"mcpOAuth": {"server": {"refreshToken": "x"}}})
+
+        with pytest.raises(SwitchError, match="no Claude login"):
+            switcher._prepare_credentials_for_activation(target, self.API_KEY)
+
+    def test_opaque_target_credential_still_activates_verbatim(
+        self, temp_home,
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher.platform = Platform.LINUX
+        switcher._setup_directories()
+        target = json.dumps({
+            "accessToken": "legacy", "refreshToken": "legacy-rt",
+        })
+
+        assert (
+            switcher._prepare_credentials_for_activation(target, "") == target
+        )
+
+    def test_mcp_only_live_blob_never_overwrites_slot_backup(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        mcp_only = json.dumps({
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        })
+        creds_store[("1", "test@example.com")] = self.API_KEY
+        target = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-target-2", "refreshToken": "rt-target-2",
+            },
+        })
+        creds_store[("2", "account2@example.com")] = target
+        live_state = {"creds": mcp_only}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+
+        try:
+            with patch.object(switcher, "list_accounts"):
+                switcher._perform_switch(
+                    "2",
+                    emit_output=False,
+                    provenance={"live": mcp_only, "resolved": None},
+                )
+        finally:
+            for p in patches:
+                p.stop()
+
+        # The MCP-only blob is nobody's login: the outgoing slot's stored
+        # credential must survive.
+        assert creds_store[("1", "test@example.com")] == self.API_KEY
+        activated = json.loads(live_state["creds"])
+        assert activated["claudeAiOauth"]["accessToken"] == "sk-target-2"
+        assert activated["mcpOAuth"] == {
+            "server": {"refreshToken": "current"}
+        }
+
 
 class TestUuidConflictClassification:
     """An email+org match with a conflicting uuid is a different account

@@ -415,7 +415,10 @@ class ClaudeAccountSwitcher:
         self._store._write_credentials(credentials)
 
     def _prepare_credentials_for_activation(
-        self, target_credentials: str, live_credentials: str | None
+        self,
+        target_credentials: str,
+        live_credentials: str | None,
+        live_authoritative: bool = True,
     ) -> str:
         """Persist shared state, then compose the credential to activate.
 
@@ -424,8 +427,17 @@ class ClaudeAccountSwitcher:
         currently absent (notably while a managed API key is active), restore that
         snapshot. Destination-slot siblings are never authoritative: if no live or
         stored shared state exists, initialize an empty snapshot.
+
+        ``live_authoritative=False`` treats the live object like an absent one:
+        the caller read it from the plaintext fallback after a failed Keychain
+        read, so its sibling fields may be stale residue and must not refresh
+        the shared snapshot — the stored snapshot is restored instead.
         """
-        live_shared = shared_credential_fields(live_credentials)
+        live_shared = (
+            shared_credential_fields(live_credentials)
+            if live_authoritative
+            else None
+        )
         if live_shared is not None:
             self._write_shared_credentials(json.dumps(live_shared))
 
@@ -433,6 +445,19 @@ class ClaudeAccountSwitcher:
             return target_credentials
 
         if not has_claude_oauth(target_credentials):
+            target_fields = shared_credential_fields(target_credentials)
+            if target_fields is not None and "mcpOAuth" in target_fields:
+                # Machine-shared OAuth state with no Claude login — the
+                # MCP-only blob Claude Code recreates while a managed API key
+                # is active, mistakenly backed up over a slot. Activating it
+                # verbatim would install no login at all while making its
+                # stale siblings authoritative. (Opaque non-MCP JSON shapes
+                # stay activatable verbatim, as before.)
+                raise SwitchError(
+                    "The stored credential for the target account contains "
+                    "no Claude login (only machine-shared OAuth state). "
+                    "Re-add the account with: cswap add --slot N"
+                )
             return target_credentials
 
         if live_shared is None:
@@ -4148,7 +4173,12 @@ class ClaudeAccountSwitcher:
                 try:
                     self._write_credentials(
                         self._prepare_credentials_for_activation(
-                            target_creds, live_creds
+                            target_creds,
+                            live_creds,
+                            live_authoritative=(
+                                not active_creds.keychain_unavailable
+                                and not active_creds.fallback_after_keychain_failure
+                            ),
                         )
                     )
                     creds_written = True
@@ -4226,7 +4256,8 @@ class ClaudeAccountSwitcher:
 
             # Create transaction for rollback capability
             try:
-                original_creds = self._read_credentials()
+                active_snapshot = self._read_active_credentials()
+                original_creds = active_snapshot.value
                 if original_creds is None:
                     raise CredentialReadError("Failed to read current credentials")
                 if not original_creds:
@@ -4318,17 +4349,35 @@ class ClaudeAccountSwitcher:
                     # call a best-effort recovery cushion. Log only:
                     # indistinguishable from a legitimate rotation, so a
                     # warning would cry wolf.
-                    self._write_account_credentials(
-                        current_account, current_email, original_creds
-                    )
-                    self._write_account_config(
-                        current_account, current_email, original_config
-                    )
-                    self._logger.info(
-                        f"Backed up account {current_account} (lineage "
-                        "differs from the stored backup and ownership could "
-                        "not be verified — pre-fix backup)"
-                    )
+                    if not looks_like_api_key(original_creds) and not (
+                        has_claude_oauth(original_creds)
+                    ):
+                        # No Claude login of either kind — e.g. the MCP-only
+                        # blob Claude Code recreates after an MCP login while
+                        # a managed API key is active. It cannot be any
+                        # slot's credential, and writing it would destroy the
+                        # slot's stored login. Keep the stored credential;
+                        # refresh the config backup only.
+                        self._write_account_config(
+                            current_account, current_email, original_config
+                        )
+                        self._logger.info(
+                            f"Skipped credential backup for account "
+                            f"{current_account} (live blob has no Claude "
+                            "login; kept the stored credential)"
+                        )
+                    else:
+                        self._write_account_credentials(
+                            current_account, current_email, original_creds
+                        )
+                        self._write_account_config(
+                            current_account, current_email, original_config
+                        )
+                        self._logger.info(
+                            f"Backed up account {current_account} (lineage "
+                            "differs from the stored backup and ownership "
+                            "could not be verified — pre-fix backup)"
+                        )
                 elif kind == "own-bytes":
                     # Untouched since cswap wrote it — the slot already holds
                     # these bytes. Refresh only the config backup.
@@ -4376,7 +4425,11 @@ class ClaudeAccountSwitcher:
                 # Step 3: Activate target account - credentials
                 self._write_credentials(
                     self._prepare_credentials_for_activation(
-                        target_creds, original_creds
+                        target_creds,
+                        original_creds,
+                        live_authoritative=(
+                            not active_snapshot.fallback_after_keychain_failure
+                        ),
                     )
                 )
                 transaction.record_step("credentials_written")

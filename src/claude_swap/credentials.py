@@ -87,10 +87,15 @@ class ActiveCredentials(NamedTuple):
     (locked / denied / timeout) and nothing else covered it — letting callers
     distinguish a transiently unreadable Keychain from a genuinely empty slot,
     instead of collapsing both into a misleading "no credentials".
+    ``fallback_after_keychain_failure`` is True when ``value`` came from the
+    plaintext file *after* a failed Keychain read: the file may be stale residue
+    from an earlier file-fallback period, so callers must not treat its
+    machine-shared sibling fields as the current generation.
     """
 
     value: str | None
     keychain_unavailable: bool
+    fallback_after_keychain_failure: bool = False
 
 
 def looks_like_api_key(credentials: str | None) -> bool:
@@ -340,7 +345,17 @@ class CredentialStore:
                 self._host._logger.error(f"Failed to read credentials file: {e}")
                 return ActiveCredentials(None, False)
             if text.strip():
-                return ActiveCredentials(text, False)
+                if keychain_failed:
+                    # The file may be residue from an earlier file-fallback
+                    # period while the Keychain holds the current generation.
+                    # It still serves as the login, but its machine-shared
+                    # sibling fields must not refresh the shared snapshot.
+                    self._host._logger.warning(
+                        "Serving the plaintext credentials file after a "
+                        "failed Keychain read; its shared OAuth fields are "
+                        "treated as untrusted"
+                    )
+                return ActiveCredentials(text, False, keychain_failed)
 
         # 3. Managed API key (Keychain "Claude Code" on macOS, then primaryApiKey).
         key = self._read_managed_key()
