@@ -6513,6 +6513,42 @@ class TestSharedOAuthCredentialPreservation:
             "server": {"refreshToken": "current"}
         }
 
+    def test_purge_reports_shared_removal_only_when_item_existed(
+        self, temp_home, capsys,
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher.platform = Platform.MACOS
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "activeAccountNumber": 1,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1],
+            "accounts": {
+                "1": {
+                    "email": "user@example.com",
+                    "uuid": "",
+                    "organizationUuid": "",
+                    "organizationName": "",
+                    "added": "2024-01-01T00:00:00Z",
+                }
+            },
+        })
+
+        mock_keyring = MagicMock()
+        with patch("builtins.input", return_value="y"), \
+             patch("claude_swap.switcher.macos_keychain") as mock_kc, \
+             patch.dict(sys.modules, {"keyring": mock_keyring}):
+            # Only the main shared item exists; the .prev item does not.
+            mock_kc.delete_password.side_effect = (
+                lambda service, username:
+                username == SHARED_CREDENTIALS_USERNAME
+            )
+            switcher.purge()
+
+        out = capsys.readouterr().out
+        assert "Shared OAuth credentials\n" in out
+        assert "previous generation" not in out
+
 
 class TestUuidConflictClassification:
     """An email+org match with a conflicting uuid is a different account

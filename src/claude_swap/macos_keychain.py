@@ -202,8 +202,12 @@ def set_password(service: str, account: str, password: str) -> None:
         )
 
 
-def delete_password(service: str, account: str) -> None:
+def delete_password(service: str, account: str) -> bool:
     """Delete a generic-password item. rc 44 (already absent) counts as success.
+
+    Returns True when an item was actually removed, False when there was
+    nothing to remove (rc 44) — so callers reporting removals to the user
+    don't claim to have deleted an item that never existed.
 
     Raises :class:`KeychainError` on any other non-zero exit or a timeout.
     """
@@ -218,8 +222,10 @@ def delete_password(service: str, account: str) -> None:
         raise KeychainError(
             f"security delete-generic-password timed out after {_TIMEOUT}s"
         ) from e
-    if result.returncode in (0, _NOT_FOUND_RC):
-        return
+    if result.returncode == 0:
+        return True
+    if result.returncode == _NOT_FOUND_RC:
+        return False
     raise KeychainError(
         f"security delete-generic-password failed (rc={result.returncode}): "
         f"{result.stderr.strip()}"

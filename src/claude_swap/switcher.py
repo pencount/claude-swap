@@ -39,6 +39,7 @@ from claude_swap.json_output import (
 from claude_swap.credentials import (  # noqa: F401  (constants re-exported for migrations/tests)
     CLAUDE_CODE_KEYCHAIN_SERVICE,
     SECURITY_SERVICE,
+    SHARED_CREDENTIALS_PREV_USERNAME,
     SHARED_CREDENTIALS_USERNAME,
     ActiveCredentials,
     CredentialStore,
@@ -4622,13 +4623,22 @@ class ClaudeAccountSwitcher:
                     _sweep_legacy_keyring(usernames, removed_items)
 
         if self.platform == Platform.MACOS:
-            try:
-                macos_keychain.delete_password(
-                    SECURITY_SERVICE, SHARED_CREDENTIALS_USERNAME
-                )
-                removed_items.append("Shared OAuth credentials")
-            except Exception:
-                pass
+            for label, username in (
+                ("Shared OAuth credentials", SHARED_CREDENTIALS_USERNAME),
+                (
+                    "Shared OAuth credentials (previous generation)",
+                    SHARED_CREDENTIALS_PREV_USERNAME,
+                ),
+            ):
+                try:
+                    if macos_keychain.delete_password(
+                        SECURITY_SERVICE, username
+                    ):
+                        removed_items.append(label)
+                except Exception as e:
+                    self._logger.warning(
+                        f"Could not remove {label} from the Keychain: {e}"
+                    )
 
         # Session-profile keychain entries must go BEFORE the backup dir:
         # the hashed service names are derived from the dir paths and can't
