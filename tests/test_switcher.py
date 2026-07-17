@@ -1717,6 +1717,9 @@ class TestPerformSwitchPostDisplay:
         def read_live():
             return live_state.get("creds", "")
 
+        def read_active():
+            return ActiveCredentials(read_live(), False)
+
         def write_live(creds):
             live_state["creds"] = creds
 
@@ -1726,6 +1729,7 @@ class TestPerformSwitchPostDisplay:
             patch.object(switcher, "_read_account_config", side_effect=read_cfg),
             patch.object(switcher, "_write_account_config", side_effect=write_cfg),
             patch.object(switcher, "_read_credentials", side_effect=read_live),
+            patch.object(switcher, "_read_active_credentials", side_effect=read_active),
             patch.object(switcher, "_write_credentials", side_effect=write_live),
         ]
         for p in patches:
@@ -2230,7 +2234,8 @@ class TestPerformSwitchPostDisplay:
 
         try:
             with patch.object(
-                switcher, "_read_credentials", return_value=None,
+                switcher, "_read_active_credentials",
+                return_value=ActiveCredentials(None, False),
             ), pytest.raises(CredentialReadError, match="snapshot"):
                 switcher._perform_switch("1")
         finally:
@@ -3535,6 +3540,7 @@ class TestPurge:
         mock_kc.delete_password.assert_has_calls([
             call("claude-swap", "account-1-user@example.com"),
             call("claude-swap", "account-None-user@example.com"),
+            call("claude-swap", SHARED_CREDENTIALS_USERNAME),
         ])
         # Best-effort legacy keyring cleanup of the old claude-code service.
         mock_keyring.delete_password.assert_has_calls([
@@ -5953,6 +5959,364 @@ class TestDirectActivationPreservation:
         assert any("--force" in w for w in op["warnings"])
         live = (temp_home / ".claude" / ".credentials.json").read_text()
         assert json.loads(live)["claudeAiOauth"]["accessToken"] == "sk-one"
+
+
+class TestSharedOAuthCredentialPreservation:
+    """Account activation must not restore stale account-independent tokens."""
+
+    API_KEY = "sk-ant-api03-" + "a1b2c3d4e5" * 4
+    _setup_two_accounts = TestPerformSwitchPostDisplay._setup_two_accounts
+    _install_store_patches = staticmethod(
+        TestPerformSwitchPostDisplay._install_store_patches
+    )
+
+    def test_live_shared_state_is_snapshotted_before_composition(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher.platform = Platform.LINUX
+        switcher._setup_directories()
+        target = json.dumps({
+            "claudeAiOauth": {"accessToken": "target"},
+            "mcpOAuth": {"server": {"refreshToken": "stale"}},
+            "targetOnlyOAuth": {"refreshToken": "stale"},
+        })
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "live"},
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+            "designOauth": {"refreshToken": "current"},
+        })
+
+        composed = json.loads(
+            switcher._prepare_credentials_for_activation(target, live)
+        )
+
+        assert composed == {
+            "claudeAiOauth": {"accessToken": "target"},
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+            "designOauth": {"refreshToken": "current"},
+        }
+        assert json.loads(switcher._read_shared_credentials()) == {
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+            "designOauth": {"refreshToken": "current"},
+        }
+
+    def test_managed_key_never_promotes_legacy_target_shared_state(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher.platform = Platform.LINUX
+        switcher._setup_directories()
+        target = json.dumps({
+            "claudeAiOauth": {"accessToken": "target"},
+            "mcpOAuth": {"server": {"refreshToken": "stale"}},
+        })
+
+        composed = json.loads(
+            switcher._prepare_credentials_for_activation(target, self.API_KEY)
+        )
+
+        assert composed == {"claudeAiOauth": {"accessToken": "target"}}
+        assert json.loads(switcher._read_shared_credentials()) == {}
+
+        other_target = json.dumps({
+            "claudeAiOauth": {"accessToken": "other-target"},
+            "mcpOAuth": {"server": {"refreshToken": "other-stale"}},
+        })
+        recomposed = json.loads(
+            switcher._prepare_credentials_for_activation(
+                other_target, self.API_KEY
+            )
+        )
+        assert recomposed == {
+            "claudeAiOauth": {"accessToken": "other-target"},
+        }
+
+    def test_fresh_activation_discards_legacy_slot_siblings(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher.platform = Platform.LINUX
+        switcher._setup_directories()
+        target = json.dumps({
+            "claudeAiOauth": {"accessToken": "target"},
+            "mcpOAuth": {"server": {"refreshToken": "stale"}},
+        })
+
+        composed = json.loads(
+            switcher._prepare_credentials_for_activation(target, "")
+        )
+
+        assert composed == {"claudeAiOauth": {"accessToken": "target"}}
+        assert json.loads(switcher._read_shared_credentials()) == {}
+
+    def test_initialized_empty_store_discards_legacy_slot_siblings(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher.platform = Platform.LINUX
+        switcher._setup_directories()
+        switcher._write_shared_credentials("{}")
+        target = json.dumps({
+            "claudeAiOauth": {"accessToken": "target"},
+            "mcpOAuth": {"server": {"refreshToken": "stale"}},
+        })
+
+        composed = json.loads(
+            switcher._prepare_credentials_for_activation(target, "")
+        )
+
+        assert composed == {"claudeAiOauth": {"accessToken": "target"}}
+
+    def test_managed_api_key_activation_snapshots_live_shared_state(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher.platform = Platform.LINUX
+        switcher._setup_directories()
+        live = json.dumps({
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        })
+
+        assert (
+            switcher._prepare_credentials_for_activation(self.API_KEY, live)
+            == self.API_KEY
+        )
+        assert json.loads(switcher._read_shared_credentials()) == {
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        }
+
+    def test_unreadable_shared_store_aborts_oauth_activation(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher.platform = Platform.LINUX
+        target = json.dumps({
+            "claudeAiOauth": {"accessToken": "target"},
+        })
+
+        with patch.object(
+            switcher, "_read_shared_credentials", return_value=None,
+        ), pytest.raises(CredentialReadError, match="shared OAuth"):
+            switcher._prepare_credentials_for_activation(target, self.API_KEY)
+
+    def test_shared_snapshot_failure_prevents_active_overwrite(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        live = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live-1", "refreshToken": "rt-live-1",
+            },
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        })
+        creds_store[("1", "test@example.com")] = live
+        creds_store[("2", "account2@example.com")] = self.API_KEY
+        sample_sequence_data["accounts"]["2"]["kind"] = "api_key"
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        live_state = {"creds": live}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+
+        try:
+            with patch.object(
+                switcher,
+                "_write_shared_credentials",
+                side_effect=OSError("disk full"),
+            ), pytest.raises(OSError, match="disk full"):
+                switcher._perform_switch(
+                    "2",
+                    emit_output=False,
+                    provenance={"live": live, "resolved": None},
+                )
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert live_state["creds"] == live
+
+    def test_direct_activation_refuses_unreadable_keychain(self, temp_home):
+        switcher, unmanaged = TestDirectActivationPreservation()._setup(temp_home)
+
+        with patch.object(
+            switcher,
+            "_read_active_credentials",
+            return_value=ActiveCredentials("", True),
+        ), pytest.raises(CredentialReadError, match="snapshot"):
+            switcher._perform_switch("1", emit_output=False)
+
+        live = (temp_home / ".claude" / ".credentials.json").read_text()
+        assert live == unmanaged
+
+    def test_normal_switch_preserves_live_shared_state(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        live = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live-1", "refreshToken": "rt-live-1",
+            },
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        })
+        target = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-target-2", "refreshToken": "rt-target-2",
+            },
+            "mcpOAuth": {"server": {"refreshToken": "stale"}},
+        })
+        creds_store[("1", "test@example.com")] = live
+        creds_store[("2", "account2@example.com")] = target
+        live_state = {"creds": live}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+
+        try:
+            with patch.object(switcher, "list_accounts"):
+                switcher._perform_switch("2", emit_output=False)
+        finally:
+            for p in patches:
+                p.stop()
+
+        activated = json.loads(live_state["creds"])
+        assert activated["claudeAiOauth"]["accessToken"] == "sk-target-2"
+        assert activated["mcpOAuth"] == {
+            "server": {"refreshToken": "current"}
+        }
+
+    def test_oauth_api_key_oauth_round_trip_preserves_shared_state(
+        self, temp_home,
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher.platform = Platform.LINUX
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "activeAccountNumber": 1,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1, 2],
+            "accounts": {
+                "1": {
+                    "email": "oauth@example.com",
+                    "uuid": "uuid-oauth",
+                    "organizationUuid": "",
+                    "organizationName": "",
+                    "added": "2024-01-01T00:00:00Z",
+                },
+                "2": {
+                    "email": "api-key-2@token.local",
+                    "uuid": "",
+                    "organizationUuid": "",
+                    "organizationName": "",
+                    "added": "2024-01-01T00:00:00Z",
+                    "kind": "api_key",
+                },
+            },
+        })
+        live = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-oauth", "refreshToken": "rt-oauth",
+            },
+            "mcpOAuth": {"server": {"refreshToken": "mcp-current"}},
+        })
+        switcher._write_account_credentials(
+            "1", "oauth@example.com", live
+        )
+        switcher._write_account_config(
+            "1", "oauth@example.com", json.dumps({
+                "oauthAccount": {
+                    "emailAddress": "oauth@example.com",
+                    "accountUuid": "uuid-oauth",
+                },
+            })
+        )
+        switcher._write_account_credentials(
+            "2", "api-key-2@token.local", self.API_KEY
+        )
+        switcher._write_account_config(
+            "2", "api-key-2@token.local", json.dumps({
+                "oauthAccount": {
+                    "emailAddress": "api-key-2@token.local",
+                    "accountUuid": "",
+                },
+            })
+        )
+        (temp_home / ".claude" / ".credentials.json").write_text(live)
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "oauth@example.com",
+                "accountUuid": "uuid-oauth",
+            },
+        }))
+
+        switcher._perform_switch(
+            "2",
+            emit_output=False,
+            provenance={"live": live, "resolved": None},
+        )
+        assert json.loads(switcher._read_shared_credentials()) == {
+            "mcpOAuth": {"server": {"refreshToken": "mcp-current"}},
+        }
+
+        switcher._perform_switch(
+            "1",
+            emit_output=False,
+            provenance={"live": self.API_KEY, "resolved": None},
+        )
+
+        restored = json.loads(
+            (temp_home / ".claude" / ".credentials.json").read_text()
+        )
+        assert restored["claudeAiOauth"]["accessToken"] == "sk-oauth"
+        assert restored["mcpOAuth"] == {
+            "server": {"refreshToken": "mcp-current"},
+        }
+
+    def test_fresh_machine_activation_survives_unreadable_keychain(
+        self, temp_home,
+    ):
+        switcher, _ = TestDirectActivationPreservation()._setup(temp_home)
+        (temp_home / ".claude.json").unlink()  # no live identity
+        (temp_home / ".claude" / ".credentials.json").unlink()
+
+        with patch.object(
+            switcher, "_read_active_credentials",
+            return_value=ActiveCredentials("", True),
+        ):
+            switcher._perform_switch("1", emit_output=False)
+
+        live = json.loads(
+            (temp_home / ".claude" / ".credentials.json").read_text()
+        )
+        assert live["claudeAiOauth"]["accessToken"] == "sk-one"
+        assert "mcpOAuth" not in live
+
+    def test_corrupt_shared_store_recovers_as_uninitialized(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher.platform = Platform.LINUX
+        switcher._setup_directories()
+        switcher._store._shared_credentials_path().write_text("not-base64!!")
+        target = json.dumps({"claudeAiOauth": {"accessToken": "target"}})
+
+        assert switcher._read_shared_credentials() == ""
+
+        composed = json.loads(
+            switcher._prepare_credentials_for_activation(target, self.API_KEY)
+        )
+
+        assert composed == {"claudeAiOauth": {"accessToken": "target"}}
+        # The corrupt file was replaced by the initialized empty snapshot —
+        # switching self-heals instead of failing forever.
+        assert json.loads(switcher._read_shared_credentials()) == {}
+
+    def test_sibling_wipe_retains_previous_shared_generation(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher.platform = Platform.LINUX
+        switcher._setup_directories()
+        snapshot = json.dumps({
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        })
+        switcher._write_shared_credentials(snapshot)
+
+        switcher._write_shared_credentials("{}")
+
+        prev = base64.b64decode(
+            switcher._store._shared_prev_path().read_text(), validate=True,
+        ).decode("utf-8")
+        assert prev == snapshot
+        assert json.loads(switcher._read_shared_credentials()) == {}
 
 
 class TestUuidConflictClassification:

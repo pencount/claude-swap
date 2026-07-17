@@ -42,7 +42,10 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     SHARED_CREDENTIALS_USERNAME,
     ActiveCredentials,
     CredentialStore,
+    has_claude_oauth,
     looks_like_api_key,
+    merge_shared_credential_fields,
+    shared_credential_fields,
 )
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
@@ -256,9 +259,9 @@ class ClaudeAccountSwitcher:
         self._poll_inputs_cache: tuple[float | None, tuple[float, tuple[str, ...]]] | None = None
         self._poll_inputs_override: tuple[float, tuple[str, ...]] | None = None
 
-        # The credential storage layer (active + per-account backup stores, macOS
-        # Keychain-vs-file routing, the per-process capability cache). Reads its
-        # live config (platform, _logger, credentials_dir) back off this switcher.
+        # The credential storage layer (active, per-account, and shared stores;
+        # macOS Keychain-vs-file routing; the per-process capability cache). Reads
+        # its live config (platform, _logger, credentials_dir) back off this switcher.
         # Constructed BEFORE run_migrations(), which performs storage ops on macOS.
         # One store per switcher: the capability cache is per-process.
         self._store = CredentialStore(self)
@@ -364,7 +367,7 @@ class ClaudeAccountSwitcher:
 
     # -- credential storage (delegates to CredentialStore) ----------------
     #
-    # The active and per-account backup credential stores live in
+    # The active, per-account backup, and shared credential stores live in
     # ``CredentialStore`` (credentials.py). The methods below are thin delegators
     # kept so existing call sites (migrations, transfer, models, session, tests)
     # keep working unchanged. The store reads platform / _logger / credentials_dir
@@ -410,6 +413,55 @@ class ClaudeAccountSwitcher:
 
     def _write_credentials(self, credentials: str) -> None:
         self._store._write_credentials(credentials)
+
+    def _prepare_credentials_for_activation(
+        self, target_credentials: str, live_credentials: str | None
+    ) -> str:
+        """Persist shared state, then compose the credential to activate.
+
+        A live JSON object is authoritative and refreshes the independent shared
+        snapshot before any active credential is overwritten. When OAuth is
+        currently absent (notably while a managed API key is active), restore that
+        snapshot. Destination-slot siblings are never authoritative: if no live or
+        stored shared state exists, initialize an empty snapshot.
+        """
+        live_shared = shared_credential_fields(live_credentials)
+        if live_shared is not None:
+            self._write_shared_credentials(json.dumps(live_shared))
+
+        if looks_like_api_key(target_credentials):
+            return target_credentials
+
+        if not has_claude_oauth(target_credentials):
+            return target_credentials
+
+        if live_shared is None:
+            stored = self._read_shared_credentials()
+            if stored is None:
+                raise CredentialReadError(
+                    "Cannot read shared OAuth credentials before activation "
+                    f"({self._store._shared_credentials_path()} or the "
+                    "Keychain snapshot is unreadable)"
+                )
+            if stored:
+                try:
+                    live_shared = json.loads(stored)
+                except json.JSONDecodeError as e:
+                    raise CredentialReadError(
+                        f"Stored shared OAuth credentials are invalid: {e}"
+                    ) from e
+                if not isinstance(live_shared, dict):
+                    raise CredentialReadError(
+                        "Stored shared OAuth credentials are not a JSON object"
+                    )
+            else:
+                # There is no trustworthy source once the live OAuth blob is gone.
+                # In particular, a target slot's sibling fields may contain
+                # rotated-out refresh tokens — the bug this store exists to avoid.
+                live_shared = {}
+                self._write_shared_credentials(json.dumps(live_shared))
+
+        return merge_shared_credential_fields(target_credentials, live_shared)
 
     def _read_shared_credentials(self) -> str | None:
         return self._store._read_shared_credentials()
@@ -4023,18 +4075,24 @@ class ClaudeAccountSwitcher:
                 if not target_oauth:
                     raise SwitchError("Invalid oauthAccount in backup")
 
-                # Snapshot live state so a mid-operation failure can be undone.
-                # When a live session exists, fail fast if the snapshot is
-                # unreadable rather than proceeding to overwrite without a
-                # safety net. The fresh-machine case has nothing to restore.
-                rollback_creds: str | None = None
+                # Read live state even without a Claude identity: the credential
+                # object may still contain MCP OAuth tokens that must survive the
+                # activation and be restored if a later step fails. Fail fast on
+                # an unusable Keychain only when a live identity exists — a fresh
+                # machine (or post-import/post-purge state) has nothing to
+                # protect, and pre-#145 it completed via the file backend.
+                active_creds = self._read_active_credentials()
+                live_creds = active_creds.value
+                if live_creds is None or (
+                    active_creds.keychain_unavailable
+                    and current_identity is not None
+                ):
+                    raise CredentialReadError(
+                        "Cannot snapshot live credentials before activation"
+                    )
+                rollback_creds = live_creds or None
                 rollback_config_text: str | None = None
                 if current_identity is not None:
-                    rollback_creds = self._read_credentials()
-                    if rollback_creds is None:
-                        raise CredentialReadError(
-                            "Cannot snapshot live credentials before activation"
-                        )
                     if config_path.exists():
                         try:
                             rollback_config_text = config_path.read_text(
@@ -4084,7 +4142,11 @@ class ClaudeAccountSwitcher:
                 creds_written = False
                 config_written = False
                 try:
-                    self._write_credentials(target_creds)
+                    self._write_credentials(
+                        self._prepare_credentials_for_activation(
+                            target_creds, live_creds
+                        )
+                    )
                     creds_written = True
 
                     # Mirror the normal switch path: preserve existing local
@@ -4301,7 +4363,11 @@ class ClaudeAccountSwitcher:
                     )
 
                 # Step 3: Activate target account - credentials
-                self._write_credentials(target_creds)
+                self._write_credentials(
+                    self._prepare_credentials_for_activation(
+                        target_creds, original_creds
+                    )
+                )
                 transaction.record_step("credentials_written")
                 self._logger.info("Wrote target credentials")
 
@@ -4394,10 +4460,10 @@ class ClaudeAccountSwitcher:
         """Remove all traces of claude-swap from the system.
 
         This removes:
-        - All stored account credentials (``.enc`` files on Linux/WSL/Windows; on
-          macOS both the Keychain items via ``security`` and any fallback ``.enc``
-          files), plus a best-effort sweep of any pre-migration keyring / Windows
-          Credential Manager entries left behind
+        - All stored account and shared OAuth credentials (``.enc`` files on
+          Linux/WSL/Windows; on macOS both the Keychain items via ``security`` and
+          any fallback ``.enc`` files), plus a best-effort sweep of any
+          pre-migration keyring / Windows Credential Manager entries left behind
         - The active backup directory (XDG path on Linux/WSL, ~/.claude-swap-backup elsewhere)
         - Any stale legacy ~/.claude-swap-backup directory left around from
           before the XDG migration
@@ -4435,9 +4501,12 @@ class ClaudeAccountSwitcher:
         if legacy_distinct and legacy.exists():
             print(f"  - Legacy backup directory: {legacy}")
         if self.platform == Platform.MACOS:
-            print("  - All stored account credentials (macOS Keychain and/or files)")
+            print(
+                "  - All stored account and shared OAuth credentials "
+                "(macOS Keychain and/or files)"
+            )
         else:
-            print("  - All stored account credential files")
+            print("  - All stored account and shared OAuth credential files")
         if session_dirs:
             print("  - All session profiles and their Keychain entries")
         print()
@@ -4487,6 +4556,15 @@ class ClaudeAccountSwitcher:
                 # never used a keyring backend.
                 if self.platform in (Platform.MACOS, Platform.WINDOWS):
                     _sweep_legacy_keyring(usernames, removed_items)
+
+        if self.platform == Platform.MACOS:
+            try:
+                macos_keychain.delete_password(
+                    SECURITY_SERVICE, SHARED_CREDENTIALS_USERNAME
+                )
+                removed_items.append("Shared OAuth credentials")
+            except Exception:
+                pass
 
         # Session-profile keychain entries must go BEFORE the backup dir:
         # the hashed service names are derived from the dir paths and can't
