@@ -1,0 +1,23 @@
+src/claude_swap/macos_keychain.py
+  s_acffc1c7ce53c2::t_260f37f138c40f 205,208-211,225-228
+src/claude_swap/switcher.py
+  s_acffc1c7ce53c2::t_1bc6a6fb170f58 42,4626-4641
+tests/test_switcher.py
+  s_acffc1c7ce53c2::t_12020af8e740ef 6516-6553
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "2fe9bd325c7f9d2751d5769a75c8fc192e839469",
+  "prompts": {},
+  "sessions": {
+    "s_acffc1c7ce53c2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "29ef2834-9718-469b-8063-b659e060c12c",
+        "model": "claude-fable-5"
+      },
+      "human_author": "pencount <149122028+pencount@users.noreply.github.com>"
+    }
+  }
+}
