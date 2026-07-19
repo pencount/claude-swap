@@ -1,0 +1,24 @@
+src/claude_swap/menubar.py
+  s_d1f6f33f13a083::t_c761bae3fafc4d 19-20,22
+  s_d1f6f33f13a083::t_173c1903da8b95 436
+  s_d1f6f33f13a083::t_505b503506a3c3 38-75
+tests/test_menubar.py
+  s_d1f6f33f13a083::t_7f333f3d8dcf4a 24-48
+  s_d1f6f33f13a083::t_4a717aa2da852a 13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "aca1c17c3b02f4eb01018ce89e2124021d6688c4",
+  "prompts": {},
+  "sessions": {
+    "s_d1f6f33f13a083": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b78b433a-38fb-4c9e-ba2c-07a65182f02a",
+        "model": "claude-fable-5"
+      },
+      "human_author": "pencount <149122028+pencount@users.noreply.github.com>"
+    }
+  }
+}
