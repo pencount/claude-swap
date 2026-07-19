@@ -208,7 +208,9 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 ## How it works
 
 - Backs up OAuth tokens and config when you add an account
-- Swaps credentials when you switch accounts
+- Swaps only the account-specific Claude login when you switch accounts;
+  live account-independent OAuth state (such as MCP server logins) is
+  preserved instead of being overwritten by a slot's older snapshot
 - Account credentials stored securely using platform-appropriate methods
 - Switches (manual and automatic) hold Claude Code's own credential locks while writing, so a swap never interleaves with a token refresh
 - Auto-switch freshens a target's token before activating it, and quarantines accounts whose refresh token has died (recover by re-adding it with `cswap add --slot N`, or by replacing its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots automatically)
@@ -274,12 +276,12 @@ Move account data between machines or back it up:
 ```bash
 cswap export backup.cswap                    # All accounts to a file
 cswap export backup.cswap --account 2        # One account
-cswap export backup.cswap --full             # Include full local ~/.claude.json (same-PC backup)
+cswap export backup.cswap --full             # Include full ~/.claude.json and credential object (same-PC backup)
 cswap import backup.cswap                    # Skips accounts that already exist
 cswap import backup.cswap --force            # Overwrite existing
 ```
 
-The export file is plaintext JSON. If you need encryption, pipe through your tool of choice (e.g. `cswap export - | gpg -c > backup.gpg`).
+The export file is plaintext JSON and, by default, carries only each account's own login — machine-shared MCP/plugin OAuth tokens and the device token stay on the source machine (`--full` keeps everything, for same-PC backups). If you need encryption, pipe through your tool of choice (e.g. `cswap export - | gpg -c > backup.gpg`).
 
 If an imported account is the one you're currently logged in as, activate the imported credentials with `cswap switch N --force` (a plain `switch` to the current account is a safe no-op and won't touch the import).
 
@@ -314,6 +316,8 @@ Every payload carries a `schemaVersion` (currently `1`); on a handled error stdo
 Usage is served from a per-account cache: when the usage API is briefly unreachable, the last-known numbers are shown instead of nothing (the human view marks them with their age, e.g. `· 2m ago`). Rows with usage carry additive `usageFetchedAt`/`usageAgeSeconds` fields telling you how old the measurement is. An account held out of rotation with `cswap disable` carries an additive `"disabled": true` on its row (absent otherwise).
 
 An account row also carries an additive `alias` field once one is set with `cswap alias` (e.g. `"alias": "dev"`); accounts without one simply omit the key.
+
+Weekly windows (`sevenDay` and any per-model `scoped` entry — never `fiveHour`) additively carry `expectedPct`/`aheadOfPace`/`projectedExhaustionAt`/`willLastToReset` once enough of the week has elapsed to make pace meaningful: `expectedPct` is the "on schedule" usage for how far into the week you are, `aheadOfPace` is `true` only when meaningfully over that (the same signal the human views show as a `(pace)`/`(ahead of pace)` marker), and `projectedExhaustionAt`/`willLastToReset` are a linear-projection ETA and its yes/no summary for whether usage stays under 100% before the next reset — `--json`-only, since the projection has wide error bars and would look falsely precise in `cswap list`/the TUI/the menu bar.
 
 </details>
 

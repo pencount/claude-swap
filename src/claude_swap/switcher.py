@@ -22,7 +22,7 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
-from claude_swap import oauth
+from claude_swap import oauth, pace
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -42,6 +42,8 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     ActiveCredentials,
     CredentialStore,
     looks_like_api_key,
+    merge_shared_credential_fields,
+    shared_credential_fields,
 )
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
@@ -106,7 +108,13 @@ _FETCH_STAGGER_S = 0.25
 _USAGE_AGE_NOTE_S = poll_policy.SERVE_TTL_S
 
 
-def _format_usage_lines(usage: dict) -> list[str]:
+def _pace_marker(window: dict, fetched_at: float | None) -> str:
+    """"  (ahead of pace)" when a weekly window is meaningfully ahead of pace, else ""."""
+    result = pace.compute_pace(window, fetched_at=fetched_at)
+    return "  (ahead of pace)" if result and result.ahead else ""
+
+
+def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[str]:
     # Collect (label, body) rows first, then pad every label to the widest one so
     # per-model names (e.g. "Fable") don't shift the columns of the other lines.
     rows: list[tuple[str, str]] = []
@@ -122,16 +130,18 @@ def _format_usage_lines(usage: dict) -> list[str]:
             rows.append(("$$", f"{pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}"))
     for label, w in (("5h", usage.get("five_hour")), ("7d", usage.get("seven_day"))):
         if w:
+            # Pace only applies to the weekly (7d) window, never 5h (issue #125).
+            marker = _pace_marker(w, fetched_at) if label == "7d" else ""
             cell = oauth.fresh_reset_strings(w)
             if cell:
                 countdown, clock = cell
-                rows.append((label, f"{w['pct']:>3.0f}%   resets {clock:<12}  in {countdown}"))
+                rows.append((label, f"{w['pct']:>3.0f}%   resets {clock:<12}  in {countdown}{marker}"))
             else:
-                rows.append((label, f"{w['pct']:>3.0f}%"))
+                rows.append((label, f"{w['pct']:>3.0f}%{marker}"))
     for w in usage.get("scoped") or []:
         # Per-model weekly limits (e.g. Fable). Flag ones at/over the limit so a
         # maxed model — the usual reason to switch — stands out.
-        marker = "  (!)" if w["pct"] >= 100 else ""
+        marker = "  (!)" if w["pct"] >= 100 else _pace_marker(w, fetched_at)
         cell = oauth.fresh_reset_strings(w)
         if cell:
             countdown, clock = cell
@@ -187,7 +197,7 @@ def _usage_entry_lines(entry: UsageEntry) -> list[str]:
             out.append(f"{dimmed('└')} {muted(last_seen)}")
         return out
     if entry.last_good is not None:
-        lines = _format_usage_lines(entry.last_good)
+        lines = _format_usage_lines(entry.last_good, entry.fetched_at)
         if (
             lines
             and entry.age_s is not None
@@ -413,31 +423,28 @@ class ClaudeAccountSwitcher:
     def _write_credentials(self, credentials: str) -> None:
         self._store._write_credentials(credentials)
 
-    @staticmethod
-    def _credentials_for_activation(
-        target_credentials: str, live_credentials: str | None
+    def _prepare_credentials_for_activation(
+        self, target_credentials: str, live_credentials: str | None
     ) -> str:
-        """Use the target Claude login without restoring stale shared OAuth state."""
-        if looks_like_api_key(target_credentials):
-            return target_credentials
+        """Compose the credential to activate from its two owners.
 
-        try:
-            target = json.loads(target_credentials)
-        except (json.JSONDecodeError, TypeError):
-            return target_credentials
-        if not isinstance(target, dict) or "claudeAiOauth" not in target:
-            return target_credentials
+        The machine-shared OAuth integrations (the ``SHARED_CREDENTIAL_KEYS``
+        allowlist, notably ``mcpOAuth``) are frozen in the slot at backup
+        time and may hold rotated-out refresh tokens, while the live
+        credential's copies are by definition the current generation — so
+        for those keys the live credential wins, absence included. Every
+        other field the destination slot stored travels with the slot:
+        account-bound state such as ``trustedDeviceToken`` — and any field
+        cswap does not recognize — must not leak across an account switch.
 
-        try:
-            live = json.loads(live_credentials) if live_credentials else {}
-        except (json.JSONDecodeError, TypeError):
-            live = {}
-        if not isinstance(live, dict):
-            live = {}
-
-        live.pop("claudeAiOauth", None)
-        live["claudeAiOauth"] = target["claudeAiOauth"]
-        return json.dumps(live)
+        When there is no live JSON credential object to take shared fields
+        from (fresh machine, or a managed API key is active), the stored
+        blob activates unchanged, exactly as before.
+        """
+        live_shared = shared_credential_fields(live_credentials)
+        if live_shared is None:
+            return target_credentials
+        return merge_shared_credential_fields(target_credentials, live_shared)
 
     def _uses_file_backup_backend(self) -> bool:
         return self._store._uses_file_backup_backend()
@@ -3312,7 +3319,7 @@ class ClaudeAccountSwitcher:
         entry = self._active_account_usage(account_num, current_email, org_uuid)
         # Decision-grade projection, same rule as the --list payload: stale
         # beyond STALE_OK_S reports unavailable, not "ok" with old numbers.
-        status, usage = usage_fields(entry.decision_value())
+        status, usage = usage_fields(entry.decision_value(), entry.fetched_at)
         active: dict = {
             "number": int(account_num),
             "email": current_email,
@@ -4360,40 +4367,44 @@ class ClaudeAccountSwitcher:
                 if not target_oauth:
                     raise SwitchError("Invalid oauthAccount in backup")
 
-                # Read live state even without a Claude identity: the credential
-                # object may still contain MCP OAuth tokens that must survive the
-                # activation and be restored if a later step fails.
-                active_creds = self._read_active_credentials()
-                live_creds = active_creds.value
-                if live_creds is None or active_creds.keychain_unavailable:
+                # Snapshot live state so a mid-operation failure can be
+                # undone, config identity or not: a wiped or half-written
+                # ~/.claude.json can orphan a live credential whose
+                # machine-shared MCP state must still reach the composer
+                # below (#135) — and the rollback, should activation fail
+                # partway. Fail fast when the snapshot is unreadable (None:
+                # the credentials file exists but could not be read) rather
+                # than overwrite state that has no safety copy; "" means
+                # absent in every backend and composes/restores nothing.
+                rollback_config_text: str | None = None
+                rollback_creds: str | None = self._read_credentials()
+                if rollback_creds is None:
                     raise CredentialReadError(
                         "Cannot snapshot live credentials before activation"
                     )
-                rollback_creds = live_creds or None
-                rollback_config_text: str | None = None
-                if current_identity is not None:
-                    if config_path.exists():
-                        try:
-                            rollback_config_text = config_path.read_text(
-                                encoding="utf-8"
-                            )
-                        except OSError as e:
-                            raise ConfigError(
-                                f"Cannot snapshot live config before activation: {e}"
-                            )
+                if current_identity is None:
+                    # Fresh machine: normalize "" so the stash, composer, and
+                    # rollback all see "nothing to preserve".
+                    rollback_creds = rollback_creds or None
+                if config_path.exists():
+                    try:
+                        rollback_config_text = config_path.read_text(
+                            encoding="utf-8"
+                        )
+                    except OSError as e:
+                        raise ConfigError(
+                            f"Cannot snapshot live config before activation: {e}"
+                        )
 
                 # Invariant II (issue #117): this path skips the backup step,
                 # so the live credential it replaces would otherwise have no
-                # surviving copy — stash it first. For an unmanaged login the
-                # stash is the only copy anywhere; for --force it guards
-                # against the "stale" live login actually being the fresher
-                # generation. A failed stash aborts, except under --force
-                # where the user explicitly asked for the overwrite.
-                if (
-                    rollback_creds
-                    and rollback_creds != target_creds
-                    and current_identity is not None
-                ):
+                # surviving copy — stash it first. For an unmanaged or
+                # config-orphaned live login the stash is the only copy
+                # anywhere; for --force it guards against the "stale" live
+                # login actually being the fresher generation. A failed stash
+                # aborts, except under --force where the user explicitly
+                # asked for the overwrite.
+                if rollback_creds and rollback_creds != target_creds:
                     try:
                         self._stash_live_credential(
                             rollback_creds,
@@ -4422,7 +4433,9 @@ class ClaudeAccountSwitcher:
                 config_written = False
                 try:
                     self._write_credentials(
-                        self._credentials_for_activation(target_creds, live_creds)
+                        self._prepare_credentials_for_activation(
+                            target_creds, rollback_creds
+                        )
                     )
                     creds_written = True
 
@@ -4597,7 +4610,10 @@ class ClaudeAccountSwitcher:
                     )
                 elif kind == "own-bytes":
                     # Untouched since cswap wrote it — the slot already holds
-                    # these bytes. Refresh only the config backup.
+                    # these bytes. Refresh only the config backup. (Rare since
+                    # #145: activation composes live shared MCP state into the
+                    # written credential, so live bytes match the slot's only
+                    # when nothing was composed in.)
                     self._write_account_config(
                         current_account, current_email, original_config
                     )
@@ -4641,7 +4657,9 @@ class ClaudeAccountSwitcher:
 
                 # Step 3: Activate target account - credentials
                 self._write_credentials(
-                    self._credentials_for_activation(target_creds, original_creds)
+                    self._prepare_credentials_for_activation(
+                        target_creds, original_creds
+                    )
                 )
                 transaction.record_step("credentials_written")
                 self._logger.info("Wrote target credentials")

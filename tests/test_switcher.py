@@ -2233,8 +2233,7 @@ class TestPerformSwitchPostDisplay:
 
         try:
             with patch.object(
-                switcher, "_read_active_credentials",
-                return_value=ActiveCredentials(None, False),
+                switcher, "_read_credentials", return_value=None,
             ), pytest.raises(CredentialReadError, match="snapshot"):
                 switcher._perform_switch("1")
         finally:
@@ -4858,6 +4857,57 @@ class TestFormatUsageLines:
         lines = _format_usage_lines(usage)
         assert lines == ["5h:   7%   resets 20:39         in 1h 30m"]
 
+    def test_seven_day_ahead_of_pace_marker(self):
+        # 1 day elapsed of the week (resets_at 6 days out), 50% used -> far
+        # ahead of the ~14% expected at that point (issue #125).
+        from datetime import datetime, timedelta, timezone
+
+        now = 1_700_000_000.0
+        resets_at = datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=6)
+        usage = {"seven_day": {"pct": 50.0, "resets_at": resets_at.isoformat()}}
+        line = _format_usage_lines(usage, now)[0]
+        assert "(ahead of pace)" in line
+
+    def test_five_hour_never_shows_pace_marker(self):
+        # Pace applies only to weekly windows, never the 5h one (issue #125).
+        from datetime import datetime, timedelta, timezone
+
+        now = 1_700_000_000.0
+        resets_at = datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(hours=4)
+        usage = {"five_hour": {"pct": 90.0, "resets_at": resets_at.isoformat()}}
+        line = _format_usage_lines(usage, now)[0]
+        assert "pace" not in line
+
+    def test_scoped_ahead_of_pace_marker_when_under_limit(self):
+        from datetime import datetime, timedelta, timezone
+
+        now = 1_700_000_000.0
+        resets_at = datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=6)
+        usage = {"scoped": [{"name": "Fable", "pct": 50.0, "resets_at": resets_at.isoformat()}]}
+        line = _format_usage_lines(usage, now)[0]
+        assert "(ahead of pace)" in line
+        assert "(!)" not in line
+
+    def test_no_pace_marker_without_fetched_at(self):
+        # No fetched_at passed -> pace isn't computable, no marker (backward
+        # compatible with callers that don't supply it).
+        from datetime import datetime, timedelta, timezone
+
+        resets_at = datetime.now(timezone.utc) + timedelta(days=6)
+        usage = {"seven_day": {"pct": 50.0, "resets_at": resets_at.isoformat()}}
+        line = _format_usage_lines(usage)[0]
+        assert "pace" not in line
+
+    def test_no_pace_marker_within_suppression_window_after_reset(self):
+        # Just reset (elapsed ~0) -> suppressed even though pct looks "ahead".
+        from datetime import datetime, timedelta, timezone
+
+        now = 1_700_000_000.0
+        resets_at = datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=7, hours=-1)
+        usage = {"seven_day": {"pct": 50.0, "resets_at": resets_at.isoformat()}}
+        line = _format_usage_lines(usage, now)[0]
+        assert "pace" not in line
+
 
 def _read_safety_copy(switcher, entry_id: str) -> str:
     """Decode a preserved credential entry straight from its file (the store
@@ -5804,15 +5854,18 @@ class TestDirectActivationPreservation:
     invariant II requires the displaced credential to be stashed first."""
 
     def _setup(self, temp_home, live_identity_email="untracked@example.com"):
+        # live_identity_email=None leaves ~/.claude.json absent entirely: a
+        # live credential without any config identity (wiped/crashed login).
         config_path = temp_home / ".claude.json"
-        config_path.write_text(json.dumps({
-            "oauthAccount": {
-                "emailAddress": live_identity_email,
-                "accountUuid": "",
-                "organizationUuid": None,
-                "organizationName": None,
-            }
-        }))
+        if live_identity_email is not None:
+            config_path.write_text(json.dumps({
+                "oauthAccount": {
+                    "emailAddress": live_identity_email,
+                    "accountUuid": "",
+                    "organizationUuid": None,
+                    "organizationName": None,
+                }
+            }))
         switcher = ClaudeAccountSwitcher()
         switcher.platform = Platform.LINUX
         switcher._setup_directories()
@@ -5879,72 +5932,251 @@ class TestDirectActivationPreservation:
         live = (temp_home / ".claude" / ".credentials.json").read_text()
         assert json.loads(live)["claudeAiOauth"]["accessToken"] == "sk-one"
 
+    def test_orphaned_live_login_without_config_identity_is_stashed(
+        self, temp_home
+    ):
+        # ~/.claude.json is gone but a live login remains: there is no
+        # config identity, yet the displaced credential still needs its
+        # safety copy — previously the missing identity skipped both the
+        # stash and the rollback snapshot.
+        switcher, orphaned = self._setup(temp_home, live_identity_email=None)
+        with patch.object(switcher, "list_accounts"):
+            switcher._perform_switch("1", emit_output=False)
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1
+        (entry_id,) = entries
+        assert _read_safety_copy(switcher, entry_id) == orphaned
+        assert entries[entry_id]["reason"] == "displaced-live-login"
+        live = (temp_home / ".claude" / ".credentials.json").read_text()
+        assert json.loads(live)["claudeAiOauth"]["accessToken"] == "sk-one"
+
+    def test_unreadable_live_credentials_without_config_identity_abort(
+        self, temp_home
+    ):
+        # None from _read_credentials means the credentials file exists but
+        # could not be read — activation must not blind-overwrite state it
+        # could not snapshot, config identity or not.
+        switcher, orphaned = self._setup(temp_home, live_identity_email=None)
+        with patch.object(switcher, "_read_credentials", return_value=None):
+            with pytest.raises(CredentialReadError, match="snapshot"):
+                switcher._perform_switch("1", emit_output=False)
+        # Live store untouched.
+        live = (temp_home / ".claude" / ".credentials.json").read_text()
+        assert live == orphaned
+
+    def test_mid_failure_restores_identityless_config(self, temp_home):
+        # A settings-bearing ~/.claude.json without oauthAccount (the normal
+        # post-logout state) must be restored when activation fails partway —
+        # previously only an identity-bearing config was snapshotted, so the
+        # credential rollback could leave mismatched halves behind.
+        switcher, orphaned = self._setup(temp_home, live_identity_email=None)
+        config_path = temp_home / ".claude.json"
+        original_config = json.dumps({"projects": {"/home/x": {"history": []}}})
+        config_path.write_text(original_config)
+
+        real_write_json = switcher._write_json
+
+        def fail_sequence_write(path, data):
+            if path == switcher.sequence_file:
+                raise OSError("disk full")
+            return real_write_json(path, data)
+
+        with patch.object(
+            switcher, "_write_json", side_effect=fail_sequence_write
+        ), pytest.raises(OSError, match="disk full"):
+            switcher._perform_switch("1", emit_output=False)
+
+        # Both halves rolled back: the settings config and the orphaned login.
+        assert config_path.read_text() == original_config
+        live = (temp_home / ".claude" / ".credentials.json").read_text()
+        assert live == orphaned
+
 
 class TestSharedOAuthCredentialPreservation:
-    """Account activation must not restore stale account-independent tokens."""
+    """Activation must not overwrite live machine-shared OAuth state
+    (mcpOAuth et al.) with the destination slot's stale snapshot (#135)."""
 
+    API_KEY = "sk-ant-api03-" + "a1b2c3d4e5" * 4
     _setup_two_accounts = TestPerformSwitchPostDisplay._setup_two_accounts
     _install_store_patches = staticmethod(
         TestPerformSwitchPostDisplay._install_store_patches
     )
 
-    def test_composition_takes_only_claude_login_from_target(self):
+    def test_live_shared_keys_win_over_stale_target_copies(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
         target = json.dumps({
             "claudeAiOauth": {"accessToken": "target"},
             "mcpOAuth": {"server": {"refreshToken": "stale"}},
-            "targetOnlyOAuth": {"refreshToken": "stale"},
+            "mcpOAuthClientConfig": {"server": {"clientId": "stale"}},
         })
         live = json.dumps({
             "claudeAiOauth": {"accessToken": "live"},
             "mcpOAuth": {"server": {"refreshToken": "current"}},
-            "designOauth": {"refreshToken": "current"},
+            "mcpOAuthClientConfig": {"server": {"clientId": "current"}},
         })
 
         composed = json.loads(
-            ClaudeAccountSwitcher._credentials_for_activation(target, live)
+            switcher._prepare_credentials_for_activation(target, live)
         )
 
         assert composed == {
             "claudeAiOauth": {"accessToken": "target"},
             "mcpOAuth": {"server": {"refreshToken": "current"}},
-            "designOauth": {"refreshToken": "current"},
+            "mcpOAuthClientConfig": {"server": {"clientId": "current"}},
         }
 
-    def test_composition_does_not_restore_shared_state_without_live_credentials(self):
+    def test_account_bound_and_unknown_siblings_stay_target_owned(
+        self, temp_home
+    ):
+        # trustedDeviceToken is enrolled per-account, and a field cswap does
+        # not recognize could be too — neither may cross an account switch.
+        # Only the SHARED_CREDENTIAL_KEYS allowlist is taken from live.
+        switcher = ClaudeAccountSwitcher()
+        target = json.dumps({
+            "claudeAiOauth": {"accessToken": "target"},
+            "trustedDeviceToken": "device-token-b",
+            "someFutureField": {"value": "target-owned"},
+        })
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "live"},
+            "trustedDeviceToken": "device-token-a",
+            "someFutureField": {"value": "live"},
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        })
+
+        composed = json.loads(
+            switcher._prepare_credentials_for_activation(target, live)
+        )
+
+        assert composed == {
+            "claudeAiOauth": {"accessToken": "target"},
+            "trustedDeviceToken": "device-token-b",
+            "someFutureField": {"value": "target-owned"},
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        }
+
+    def test_shared_key_absent_from_live_is_not_resurrected(self, temp_home):
+        # Shared keys are live-owned in absence too: if the machine no
+        # longer holds an MCP session, the slot's stale copy must not
+        # reintroduce it.
+        switcher = ClaudeAccountSwitcher()
+        target = json.dumps({
+            "claudeAiOauth": {"accessToken": "target"},
+            "mcpOAuth": {"server": {"refreshToken": "stale"}},
+        })
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "live"},
+        })
+
+        composed = json.loads(
+            switcher._prepare_credentials_for_activation(target, live)
+        )
+
+        assert composed == {"claudeAiOauth": {"accessToken": "target"}}
+
+    def test_direct_activation_without_config_identity_composes_live_state(
+        self, temp_home
+    ):
+        # A wiped or half-written ~/.claude.json orphans the live credential:
+        # no config identity, but the live item still holds the machine's
+        # MCP state — direct activation must compose it in, not clobber it.
+        switcher = ClaudeAccountSwitcher()
+        switcher.platform = Platform.LINUX
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "activeAccountNumber": None,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1],
+            "accounts": {
+                "1": {
+                    "email": "one@example.com",
+                    "uuid": "uuid-one",
+                    "organizationUuid": "",
+                    "organizationName": "",
+                    "added": "2024-01-01T00:00:00Z",
+                },
+            },
+        })
+        switcher._write_account_credentials("1", "one@example.com", json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-one", "refreshToken": "rt-one"},
+            "mcpOAuth": {"server": {"refreshToken": "stale"}},
+        }))
+        switcher._write_account_config("1", "one@example.com", json.dumps({
+            "oauthAccount": {
+                "emailAddress": "one@example.com", "accountUuid": "uuid-one",
+            },
+        }))
+        live_path = temp_home / ".claude" / ".credentials.json"
+        live_path.write_text(json.dumps({
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        }))
+
+        with patch.object(switcher, "list_accounts"):
+            switcher._perform_switch("1", emit_output=False)
+
+        assert json.loads(live_path.read_text()) == {
+            "claudeAiOauth": {"accessToken": "sk-one", "refreshToken": "rt-one"},
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        }
+
+    def test_api_key_live_state_activates_target_verbatim(self, temp_home):
+        # While a managed API key is active there is no live OAuth object to
+        # take siblings from; the stored blob activates unchanged (the
+        # pre-existing behavior — the API-key round trip is out of scope).
+        switcher = ClaudeAccountSwitcher()
         target = json.dumps({
             "claudeAiOauth": {"accessToken": "target"},
             "mcpOAuth": {"server": {"refreshToken": "stale"}},
         })
 
-        composed = json.loads(
-            ClaudeAccountSwitcher._credentials_for_activation(target, "")
+        assert (
+            switcher._prepare_credentials_for_activation(target, self.API_KEY)
+            == target
         )
 
-        assert composed == {"claudeAiOauth": {"accessToken": "target"}}
+    def test_absent_live_state_activates_target_verbatim(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        target = json.dumps({
+            "claudeAiOauth": {"accessToken": "target"},
+            "mcpOAuth": {"server": {"refreshToken": "old"}},
+        })
 
-    def test_composition_leaves_managed_api_keys_unchanged(self):
-        api_key = "sk-ant-api03-" + "a1b2c3d4e5" * 4
+        assert (
+            switcher._prepare_credentials_for_activation(target, "") == target
+        )
+        assert (
+            switcher._prepare_credentials_for_activation(target, None)
+            == target
+        )
+
+    def test_api_key_target_is_never_composed(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
         live = json.dumps({
+            "claudeAiOauth": {"accessToken": "live"},
             "mcpOAuth": {"server": {"refreshToken": "current"}},
         })
 
         assert (
-            ClaudeAccountSwitcher._credentials_for_activation(api_key, live)
-            == api_key
+            switcher._prepare_credentials_for_activation(self.API_KEY, live)
+            == self.API_KEY
         )
 
-    def test_direct_activation_refuses_unreadable_keychain(self, temp_home):
-        switcher, unmanaged = TestDirectActivationPreservation()._setup(temp_home)
+    def test_opaque_target_credential_activates_verbatim(self, temp_home):
+        # Opaque/legacy JSON shapes without a claudeAiOauth login are
+        # activated byte-for-byte, as before.
+        switcher = ClaudeAccountSwitcher()
+        target = json.dumps({
+            "accessToken": "legacy", "refreshToken": "legacy-rt",
+        })
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "live"},
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        })
 
-        with patch.object(
-            switcher,
-            "_read_active_credentials",
-            return_value=ActiveCredentials("", True),
-        ), pytest.raises(CredentialReadError, match="snapshot"):
-            switcher._perform_switch("1", emit_output=False)
-
-        live = (temp_home / ".claude" / ".credentials.json").read_text()
-        assert live == unmanaged
+        assert (
+            switcher._prepare_credentials_for_activation(target, live)
+            == target
+        )
 
     def test_normal_switch_preserves_live_shared_state(
         self, temp_home, mock_claude_config, sample_sequence_data,
@@ -5980,6 +6212,33 @@ class TestSharedOAuthCredentialPreservation:
 
         activated = json.loads(live_state["creds"])
         assert activated["claudeAiOauth"]["accessToken"] == "sk-target-2"
+        assert activated["mcpOAuth"] == {
+            "server": {"refreshToken": "current"}
+        }
+
+    def test_direct_activation_preserves_live_shared_state(self, temp_home):
+        switcher, _ = TestDirectActivationPreservation()._setup(temp_home)
+        live_path = temp_home / ".claude" / ".credentials.json"
+        live = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-unmanaged", "refreshToken": "rt-unmanaged",
+            },
+            "mcpOAuth": {"server": {"refreshToken": "current"}},
+        })
+        live_path.write_text(live)
+        target = json.loads(
+            switcher._read_account_credentials("1", "one@example.com")
+        )
+        target["mcpOAuth"] = {"server": {"refreshToken": "stale"}}
+        switcher._write_account_credentials(
+            "1", "one@example.com", json.dumps(target)
+        )
+
+        with patch.object(switcher, "list_accounts"):
+            switcher._perform_switch("1", emit_output=False)
+
+        activated = json.loads(live_path.read_text())
+        assert activated["claudeAiOauth"]["accessToken"] == "sk-one"
         assert activated["mcpOAuth"] == {
             "server": {"refreshToken": "current"}
         }
